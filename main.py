@@ -1,8 +1,21 @@
 """
 main.py
-v5.13 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.18 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.18: при включённой чистке метаданных фото с тегом EXIF Orientation
+        физически поворачиваются до чистки (exiftool -all= удаляет этот тег,
+        и вертикальные кадры иначе ложились бы на бок). JPEG пересохраняется
+        с quality 95; в txt-списке такие файлы помечены "rotated upright".
+- v5.17: (1) автокоррекция тёмных фото (photo_fix.py; /settings: выкл / авто /
+        всегда) — только JPEG/PNG, перед чисткой метаданных; (2) настройка
+        «txt-список файлов»: в папку кладётся upload_list_<дата>.txt (на
+        английском, UTF-8 с BOM) с пометкой edited/original по каждому файлу;
+        (3) бот везде называется PixKeep. REQUIRES две новые колонки в
+        user_settings — SQL в README и в db.py.
+- v5.16: «Мои загрузки» — удаление отдельных файлов из загрузки (список с
+        постраничной навигацией; последний удалённый файл убирает и пустую
+        папку, как полное удаление).
 - v5.15: "📂 Мои загрузки" (кнопка под полем ввода + /uploads): последние 10
         загрузок, по каждой — открыть/скопировать ссылку, закрыть/открыть
         доступ по ссылке, удалить (файлы и пустая папка уходят в корзину
@@ -229,7 +242,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.15"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.18"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -280,6 +293,7 @@ from db import (
     remove_all_accounts,
 )
 from exif_utils import inspect_metadata, strip_exif
+from photo_fix import fix_photo, normalize_orientation
 from drive_utils import (
     ensure_folder,
     upload_file,
@@ -452,7 +466,7 @@ async def start(message: Message):
         [InlineKeyboardButton(text="🔗 Подключить Google Drive", url=auth_url)]
     ])
     await message.answer(
-        "Привет! Я CleanDrive — чищу метаданные (EXIF/GPS/IPTC/XMP) из фото и файлов "
+        "Привет! Я PixKeep — чищу метаданные (EXIF/GPS/IPTC/XMP) из фото и файлов "
         "без потери качества и складываю результат на твой Google Drive.\n\n"
         "Сначала подключи свой Диск — откроется страница Google, войди и "
         "разреши доступ. Пароль вводится только у Google, я его не вижу. "
@@ -493,6 +507,11 @@ UPLOADS_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def _real(files: list[dict]) -> list[dict]:
+    """History entries without the service txt list."""
+    return [f for f in files if not f.get("report")]
+
+
 def _fmt_dt(iso: str) -> str:
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -519,14 +538,14 @@ def _uploads_list_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
     if not rows:
         return "Загрузок пока нет.", None
     kb = [[InlineKeyboardButton(
-        text=f"{_fmt_dt(r['created_at'])} · {r['folder_name']} · {len(r['files'])} ф.",
+        text=f"{_fmt_dt(r['created_at'])} · {r['folder_name']} · {len(_real(r['files']))} ф.",
         callback_data=f"up:{r['id']}",
     )] for r in rows]
     return "📂 Последние загрузки — выбери:", InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
-    names = [f["name"] for f in u["files"]]
+    names = [f["name"] for f in _real(u["files"])]
     shown = ", ".join(names[:15]) + (f" … и ещё {len(names) - 15}" if len(names) > 15 else "")
     access = ("🔓 доступ по ссылке открыт" if u.get("shared", True)
               else "🔒 доступ по ссылке закрыт")
@@ -545,7 +564,8 @@ def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
     else:
         kb.append([InlineKeyboardButton(text="🔓 Открыть доступ по ссылке",
                                         callback_data=f"upsh:{uid}")])
-    kb.append([InlineKeyboardButton(text="🗑 Удалить загрузку", callback_data=f"updel:{uid}")])
+    kb.append([InlineKeyboardButton(text="🗑 Удалить отдельные файлы", callback_data=f"upf:{uid}:0")])
+    kb.append([InlineKeyboardButton(text="🗑 Удалить всю загрузку", callback_data=f"updel:{uid}")])
     kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="uplist")])
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -620,6 +640,100 @@ async def on_upload_share_toggle(cq: CallbackQuery):
     await cq.answer(note)
 
 
+FILES_PER_PAGE = 8
+
+
+def _upload_files_view(u: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    files = _real(u["files"])
+    pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
+    page = min(max(page, 0), pages - 1)
+    chunk = files[page * FILES_PER_PAGE:(page + 1) * FILES_PER_PAGE]
+    uid = u["id"]
+    kb = [[InlineKeyboardButton(
+        text=f"🗑 {f['name']}"[:60], callback_data=f"upfd:{uid}:{f['id']}"
+    )] for f in chunk]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"upf:{uid}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"upf:{uid}:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"up:{uid}")])
+    text = (f"Нажми на файл, чтобы удалить его (уйдёт в корзину Google Диска).\n"
+            f"Папка «{u['folder_name']}», файлов: {len(files)}"
+            + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""))
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@dp.callback_query(F.data.regexp(r"^upf:\d+:\d+$"))
+async def on_upload_files(cq: CallbackQuery):
+    _, raw_id, raw_page = cq.data.split(":")
+    u = get_upload(cq.from_user.id, int(raw_id))
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    text, kb = _upload_files_view(u, int(raw_page))
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^upfd:\d+:[\w-]+$"))
+async def on_upload_file_delete(cq: CallbackQuery):
+    _, raw_id, file_id = cq.data.split(":")
+    tg = cq.from_user.id
+    u = get_upload(tg, int(raw_id))
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    target = next((f for f in _real(u["files"]) if f["id"] == file_id), None)
+    if not target:
+        # tapped twice / stale button — just refresh the list
+        text, kb = _upload_files_view(u, 0)
+        await cq.message.edit_text(text, reply_markup=kb)
+        await cq.answer("Этого файла уже нет в списке")
+        return
+    account = await _account_for(cq, u)
+    if not account:
+        return
+
+    rest = [f for f in u["files"] if f["id"] != file_id]
+    rest_real = _real(rest)
+    folder_gone = False
+
+    async def _do(session, token):
+        nonlocal folder_gone
+        await trash_file(session, token, file_id)
+        if not rest_real:
+            for rf in rest:            # service txt list goes with the last file
+                await trash_file(session, token, rf["id"])
+        if not rest_real and await folder_is_empty(session, token, u["folder_id"]):
+            await trash_file(session, token, u["folder_id"])
+            folder_gone = True
+
+    try:
+        await _with_drive(account, _do)
+    except Exception as e:
+        logging.exception("delete single file failed")
+        await cq.answer(f"Ошибка: {e}"[:190], show_alert=True)
+        return
+
+    if not rest_real:
+        if folder_gone:
+            delete_uploads_by_folder(tg, u["folder_id"])
+        else:
+            delete_upload(tg, u["id"])
+        await cq.message.edit_text("🗑 Файл удалён — это был последний в загрузке, она убрана из списка.")
+        await cq.answer()
+        return
+
+    update_upload(tg, u["id"], files=rest)
+    u["files"] = rest
+    text, kb = _upload_files_view(u, 0)
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer(f"Удалён: {target['name']}")
+
+
 @dp.callback_query(F.data.regexp(r"^updel:\d+$"))
 async def on_upload_delete_ask(cq: CallbackQuery):
     uid = int(cq.data.split(":")[1])
@@ -632,7 +746,7 @@ async def on_upload_delete_ask(cq: CallbackQuery):
         [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"up:{uid}")],
     ])
     await cq.message.edit_text(
-        f"Удалить {len(u['files'])} файл(ов) из папки «{u['folder_name']}»?\n"
+        f"Удалить {len(_real(u['files']))} файл(ов) из папки «{u['folder_name']}»?\n"
         "Они уйдут в корзину Google Диска (там их можно восстановить в течение "
         "30 дней). Если папка опустеет, она тоже уйдёт в корзину.",
         reply_markup=kb,
@@ -685,7 +799,7 @@ async def on_upload_delete_do(cq: CallbackQuery):
     if failed:
         update_upload(tg, uid, files=failed)
         await cq.message.edit_text(
-            f"Удалено {len(u['files']) - len(failed)}, не удалось: "
+            f"Удалено {len(_real(u['files'])) - len(_real(failed))}, не удалось: "
             f"{', '.join(f['name'] for f in failed)}.\nМожно повторить из списка /uploads."
         )
         return
@@ -714,7 +828,15 @@ async def logout(message: Message):
 async def version_cmd(message: Message):
     """Diagnostic: confirms which code is actually running on the server,
     since a stale deploy is indistinguishable from a code bug otherwise."""
-    await message.answer(f"CleanDrive v{VERSION}")
+    await message.answer(f"PixKeep v{VERSION}")
+
+
+PHOTO_FIX_ORDER = ["off", "auto", "always"]
+PHOTO_FIX_LABELS = {
+    "off": "выкл",
+    "auto": "авто (только тёмные)",
+    "always": "всегда (поднять тени)",
+}
 
 
 def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
@@ -722,6 +844,8 @@ def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
     rename_mark = "✅" if s["anonymize_names"] else "⬜"
     date_mark = "✅" if s["auto_date_folder"] else "⬜"
     replace_mark = "✅" if s["replace_duplicates"] else "⬜"
+    list_mark = "✅" if s["upload_list"] else "⬜"
+    fix_label = PHOTO_FIX_LABELS.get(s["photo_fix"], PHOTO_FIX_LABELS["off"])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"{clean_mark} Чистить метаданные (EXIF/GPS)",
@@ -738,6 +862,14 @@ def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"{replace_mark} Заменять файлы с таким же именем",
             callback_data="toggle:replace_duplicates",
+        )],
+        [InlineKeyboardButton(
+            text=f"🌗 Коррекция тёмных фото: {fix_label}",
+            callback_data="cycle:photo_fix",
+        )],
+        [InlineKeyboardButton(
+            text=f"{list_mark} Список файлов (txt) в папку",
+            callback_data="toggle:upload_list",
         )],
     ])
 
@@ -762,11 +894,25 @@ async def on_toggle_setting(cq: CallbackQuery):
     if field not in s:
         await cq.answer()
         return
+    if not isinstance(s[field], bool):
+        await cq.answer()
+        return
     new_value = not s[field]
     set_setting(cq.from_user.id, field, new_value)
     s[field] = new_value
     await cq.message.edit_reply_markup(reply_markup=_settings_keyboard(s))
     await cq.answer("Обновлено")
+
+
+@dp.callback_query(F.data == "cycle:photo_fix")
+async def on_cycle_photo_fix(cq: CallbackQuery):
+    s = get_settings(cq.from_user.id)
+    cur = s["photo_fix"] if s["photo_fix"] in PHOTO_FIX_ORDER else "off"
+    new_value = PHOTO_FIX_ORDER[(PHOTO_FIX_ORDER.index(cur) + 1) % len(PHOTO_FIX_ORDER)]
+    set_setting(cq.from_user.id, "photo_fix", new_value)
+    s["photo_fix"] = new_value
+    await cq.message.edit_reply_markup(reply_markup=_settings_keyboard(s))
+    await cq.answer(PHOTO_FIX_LABELS[new_value])
 
 
 # ------------------------------------------------------------ media intake ---
@@ -935,6 +1081,32 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         gps_count = sum(1 for m in metas if m["has_gps"])
         exif_dates = [d for d in (_parse_exif_date(m["datetime"]) for m in metas) if d]
 
+        # v5.18: cleaning drops the EXIF Orientation tag, so photos stored
+        # sideways (typical for portrait shots) must be physically rotated first.
+        if settings["clean_metadata"]:
+            rot_dir = os.path.join(work_dir, "rotated")
+            os.makedirs(rot_dir, exist_ok=True)
+            for it in items:   # one at a time: keeps memory low
+                out = os.path.join(rot_dir, it["orig_name"])
+                if await asyncio.to_thread(normalize_orientation, it["path"], out):
+                    it["path"] = out
+                    it["rotated"] = True
+        rotated_count = sum(1 for it in items if it.get("rotated"))
+
+        fix_mode = settings["photo_fix"]
+        if fix_mode in ("auto", "always"):
+            fix_dir = os.path.join(work_dir, "fixed")
+            os.makedirs(fix_dir, exist_ok=True)
+            for it in items:   # one at a time on purpose: keeps memory low
+                out = os.path.join(fix_dir, it["orig_name"])
+                res = await asyncio.to_thread(fix_photo, it["path"], out, fix_mode)
+                if res["edited"]:
+                    it["path"] = out
+                    it["edited"] = True
+                else:
+                    logging.info(f"photo_fix skipped {it['orig_name']}: {res['note']}")
+        edited_count = sum(1 for it in items if it.get("edited"))
+
         if settings["clean_metadata"]:
             clean_dir = os.path.join(work_dir, "clean")
             os.makedirs(clean_dir, exist_ok=True)
@@ -961,6 +1133,11 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     )
     if settings["replace_duplicates"]:
         note += "\n♻️ Файлы с таким же именем в папке будут заменены."
+    if rotated_count:
+        note += f"\n↻ Повернул {rotated_count} фото в нормальное положение (иначе после чистки метаданных они лежали бы на боку)."
+    if settings["photo_fix"] in ("auto", "always"):
+        note += (f"\n🌗 Подправил яркость: {edited_count} из {len(items)}"
+                 if edited_count else "\n🌗 Коррекция включена, но подправлять было нечего.")
 
     if settings["auto_date_folder"]:
         folder_name = _pick_folder_date(exif_dates, messages).strftime("%d.%m.%y")
@@ -1140,6 +1317,54 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
     return results, url, folder_id
 
 
+def _build_list_text(folder_name: str, results: list[dict], s: dict) -> str:
+    now = datetime.now(LOCAL_TZ)
+    ok = [r for r in results if r["success"]]
+    bad = [r for r in results if not r["success"]]
+    lines = [
+        "PixKeep upload list",
+        f"Date: {now:%Y-%m-%d %H:%M} (Europe/Minsk)",
+        f"Folder: {folder_name.strip()}",
+        f"Metadata: {'cleaned' if s['clean_metadata'] else 'kept'}",
+        f"Photo correction: {s['photo_fix']}",
+        f"Files: {len(ok)} uploaded, {len(bad)} failed",
+        "",
+    ]
+    for r in results:
+        if r["success"]:
+            line = f"{r['upload_name']} - {'edited' if r.get('edited') else 'original'}"
+            if r.get("rotated"):
+                line += ", rotated upright"
+            if r["upload_name"] != r["orig_name"]:
+                line += f" [was: {r['orig_name']}]"
+        else:
+            line = f"{r['orig_name']} - FAILED"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+async def _upload_list_file(account: dict, folder_id: str, folder_name: str,
+                            results: list[dict], s: dict, tmp_dir: str) -> dict:
+    """Writes the txt list (UTF-8 with BOM so Windows Notepad reads it) and
+    uploads it into the batch's folder. Returns a history entry flagged
+    report=True so «Мои загрузки» can treat it as a service file."""
+    name = f"upload_list_{datetime.now(LOCAL_TZ):%Y-%m-%d_%H-%M-%S}.txt"
+    os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, name)
+    with open(path, "w", encoding="utf-8-sig") as f:
+        f.write(_build_list_text(folder_name, results, s))
+    try:
+        file_id = await _with_drive(
+            account, lambda sess, tok: upload_file(sess, tok, path, folder_id, name)
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return {"id": file_id, "name": name, "report": True}
+
+
 async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
                      work_dir: str | None, folder_name: str) -> None:
     """Shared by both the manual folder-name prompt and the auto-date-folder
@@ -1154,7 +1379,8 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
 
     await bot.send_message(chat_id, f"Загружаю в папку «{folder_name}»...")
 
-    replace_duplicates = get_settings(telegram_id)["replace_duplicates"]
+    user_settings = get_settings(telegram_id)
+    replace_duplicates = user_settings["replace_duplicates"]
     try:
         async with _heartbeat(chat_id):
             results, link, folder_id = await _upload_all(account, items, folder_name, replace_duplicates)
@@ -1168,6 +1394,19 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     succeeded = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
 
+    # v5.17: optional txt list of the batch, uploaded next to the files.
+    report_entry = None
+    list_failed = False
+    if user_settings["upload_list"] and succeeded:
+        try:
+            report_entry = await _upload_list_file(
+                account, folder_id, folder_name, results, user_settings,
+                work_dir or config.TEMP_DIR,
+            )
+        except Exception:
+            logging.exception("couldn't upload txt list")
+            list_failed = True
+
     lines = []
     if succeeded:
         names = ", ".join(r["upload_name"] for r in succeeded)
@@ -1175,6 +1414,10 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     if failed:
         names = ", ".join(r["orig_name"] for r in failed)
         lines.append(f"❌ Не удалось загрузить ({len(failed)}): {names}")
+    if report_entry:
+        lines.append(f"📝 Список файлов: {report_entry['name']}")
+    elif list_failed:
+        lines.append("⚠️ txt-список загрузить не удалось (файлы при этом загружены).")
     if succeeded:
         lines.append(f"\nПапка (доступ на чтение всем, у кого есть ссылка):\n{link}")
 
@@ -1196,7 +1439,8 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
         try:
             save_upload(
                 telegram_id, account["id"], folder_id, folder_name.strip(), link,
-                [{"id": r["file_id"], "name": r["upload_name"]} for r in succeeded],
+                [{"id": r["file_id"], "name": r["upload_name"]} for r in succeeded]
+                + ([report_entry] if report_entry else []),
             )
         except Exception:
             logging.exception("couldn't record upload in history")

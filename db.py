@@ -29,6 +29,10 @@ Tables (create once, SQL in README):
             created_at timestamptz default now())
 
 Changelog:
+- v5.6: settings photo_fix (text: off/auto/always) and upload_list (boolean).
+        REQUIRED migration before deploying v5.17:
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS photo_fix text default 'off';
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS upload_list boolean default false;
 - v5.5: "Мои загрузки" — uploads table + save/list/get/update/delete helpers,
         get_account_by_id; logout also clears the user's uploads.
 - v5.4: keep_alive_loop() — periodic lightweight query so the free Supabase
@@ -70,6 +74,8 @@ DEFAULT_SETTINGS = {
     "anonymize_names": False,
     "auto_date_folder": False,
     "replace_duplicates": False,
+    "photo_fix": "off",        # off | auto | always   (v5.17)
+    "upload_list": False,      # put a txt list of files into the folder (v5.17)
 }
 
 
@@ -95,7 +101,7 @@ def get_settings(telegram_id: int) -> dict:
     }
 
 
-def set_setting(telegram_id: int, field: str, value: bool) -> None:
+def set_setting(telegram_id: int, field: str, value) -> None:
     if field not in DEFAULT_SETTINGS:
         raise ValueError(f"Unknown setting: {field}")
     _supabase.table("user_settings").upsert({

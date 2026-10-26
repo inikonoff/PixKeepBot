@@ -1,4 +1,4 @@
-# CleanDrive Bot (multi-user, multi-account, v5.0, Google Drive backend)
+# PixKeep Bot (multi-user, multi-account, v5.18, Google Drive backend)
 
 Чистит метаданные (EXIF/GPS/IPTC/XMP) из фото и файлов без потери качества и
 складывает результат на **Google Drive** пользователя. Каждый может
@@ -108,6 +108,12 @@ create index if not exists idx_uploads_telegram on uploads(telegram_id, created_
 **Если обновляешься с v5.14** — выполни только блок `create table ... uploads`
 выше ДО деплоя (без таблицы бот продолжит грузить, но «Мои загрузки» будут
 пустыми/с ошибкой).
+
+**v5.17 — две новые колонки** (выполни ДО деплоя, иначе сломаются все загрузки):
+```sql
+alter table user_settings add column if not exists photo_fix text default 'off';
+alter table user_settings add column if not exists upload_list boolean default false;
+```
 
 **Если у тебя уже есть `user_settings` без колонки `replace_duplicates`**
 (т.е. обновляешься на v5.10) — обязательно добавь её ДО деплоя новой версии
