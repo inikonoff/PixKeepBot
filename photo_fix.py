@@ -1,16 +1,18 @@
 """
 photo_fix.py
-v1.0 - "auto" brightness / shadow lift for dark photos (Pillow only, no numpy)
+v1.1 - "auto" brightness / shadow lift for dark photos (Pillow only, no numpy)
 
 Modes (user setting `photo_fix`):
     off     - never touch pixels
-    auto    - only fix clearly dark photos (median brightness below DARK_MEDIAN)
+    auto    - only fix photos with dark shadows or a dark overall exposure
     always  - lift shadows on every photo (at least a mild lift)
 
 How: a single per-channel tone curve (look-up table) built from a small
-thumbnail's statistics — black point trimmed, then a gamma lift so the median
-brightness approaches TARGET_MEDIAN. White stays white, so highlights are not
-blown. Applied with Image.point(), so memory stays ~2-3x the image size.
+thumbnail's statistics — black point trimmed, then a shadow-lift curve whose
+strength is chosen so the 20th-percentile (shadow) brightness reaches
+TARGET_P20. Judging by shadows rather than the median matters for scenes like
+a dark foreground under a bright sky, where the median looks "normal".
+White stays white, so highlights are not blown. Applied with Image.point(), so memory stays ~2-3x the image size.
 
 Only JPEG/PNG in plain RGB are handled; everything else is left untouched.
 JPEG is re-saved at quality 95 with the original EXIF + ICC profile (EXIF is
@@ -24,21 +26,36 @@ import os
 
 from PIL import Image, ImageOps, ImageStat, JpegImagePlugin
 
-DARK_MEDIAN = 85        # auto mode: median luma (0-255) below this = "dark"
-TARGET_MEDIAN = 120     # where the curve tries to bring the median
-MIN_GAMMA = 0.5         # never lift harder than this (limits noise blow-up)
-ALWAYS_GAMMA = 0.82     # "always" mode: at least this much lift
+DARK_P20 = 56           # auto mode: 20th-percentile luma below this = dark shadows
+DARK_MEDIAN = 85        # ...or median luma below this = dark photo
+TARGET_P20 = 82         # shadow lift tries to bring the 20th percentile here
+MAX_STRENGTH = 3.5      # cap on lift (limits noise blow-up)
+ALWAYS_MIN_STRENGTH = 1.0  # "always" mode: at least this much lift
 MAX_PIXELS = 40_000_000  # skip anything bigger (memory on small hosts)
 JPEG_QUALITY = 95
 
 
-def _build_lut(black: int, gamma: float) -> list[int]:
+def _build_lut(black: int, strength: float) -> list[int]:
+    """Shadow-lift curve on x in [0,1] (after black-point trim):
+        y = x * (1 + s * (1 - x)^3)
+    y(0)=0 and y(1)=1 (highlights untouched), strongest push in the shadows
+    and lower mids, monotonic for s <= 3.9."""
     span = max(255 - black, 1)
     lut = []
-    for x in range(256):
-        v = max(x - black, 0) / span
-        lut.append(min(255, round(255 * (v ** gamma))))
+    for v in range(256):
+        x = max(v - black, 0) / span
+        y = x * (1 + strength * (1 - x) ** 3)
+        lut.append(min(255, round(255 * y)))
     return lut
+
+
+def _strength_for(p20: float) -> float:
+    """Solve y(q) = TARGET_P20/255 for s, where q is the shadow level."""
+    q = max(p20, 8) / 255
+    t = TARGET_P20 / 255
+    if t <= q:
+        return 0.0
+    return min((t / q - 1) / (1 - q) ** 3, MAX_STRENGTH)
 
 
 def normalize_orientation(src: str, dst: str) -> bool:
@@ -100,30 +117,31 @@ def fix_photo(src: str, dst: str, mode: str) -> dict:
             else:
                 thumb = thumb.convert("L")
             thumb.thumbnail((320, 320))
-            stat = ImageStat.Stat(thumb)
-            median = stat.median[0]
+            median = ImageStat.Stat(thumb).median[0]
             hist = thumb.histogram()
             total = sum(hist)
-            acc, black = 0, 0
-            for i, c in enumerate(hist):
-                acc += c
-                if acc >= total * 0.01:
-                    black = i
-                    break
-            black = min(black, 20)
 
-        if mode == "auto" and median >= DARK_MEDIAN:
-            return {"edited": False, "note": "not dark"}
+            def _pct(frac: float) -> int:
+                acc = 0
+                for i, c in enumerate(hist):
+                    acc += c
+                    if acc >= total * frac:
+                        return i
+                return 255
 
-        med = max(median, 8)
-        gamma = math.log(TARGET_MEDIAN / 255) / math.log(med / 255)
-        gamma = max(MIN_GAMMA, min(gamma, 1.0))
+            black = min(_pct(0.01), 12)
+            p20 = _pct(0.20)
+
+        if mode == "auto" and p20 >= DARK_P20 and median >= DARK_MEDIAN:
+            return {"edited": False, "note": f"not dark (p20 {p20}, median {int(median)})"}
+
+        strength = _strength_for(p20)
         if mode == "always":
-            gamma = min(gamma, ALWAYS_GAMMA)
-        if gamma > 0.97 and black == 0:
-            return {"edited": False, "note": "no change needed"}
+            strength = max(strength, ALWAYS_MIN_STRENGTH)
+        if strength < 0.15 and black == 0:
+            return {"edited": False, "note": f"no change needed (p20 {p20})"}
 
-        lut = _build_lut(black, gamma) * 3
+        lut = _build_lut(black, strength) * 3
         with Image.open(src) as im:
             im.load()
             out = im.point(lut)
@@ -142,7 +160,7 @@ def fix_photo(src: str, dst: str, mode: str) -> dict:
             else:
                 out.save(dst, "PNG", optimize=False, **kwargs)
         return {"edited": True,
-                "note": f"brightness adjusted (median {int(median)} -> gamma {gamma:.2f})"}
+                "note": f"shadows lifted (p20 {p20}, median {int(median)}, strength {strength:.2f})"}
     except Exception as e:  # corrupt file, unsupported variant, etc.
         if os.path.exists(dst):
             try:

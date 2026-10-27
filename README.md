@@ -1,4 +1,4 @@
-# PixKeep Bot (multi-user, multi-account, v5.18, Google Drive backend)
+# PixKeep Bot (multi-user, multi-account, v5.19, Google Drive backend)
 
 Чистит метаданные (EXIF/GPS/IPTC/XMP) из фото и файлов без потери качества и
 складывает результат на **Google Drive** пользователя. Каждый может

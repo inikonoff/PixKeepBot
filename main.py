@@ -1,8 +1,13 @@
 """
 main.py
-v5.18 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.19 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.19: photo_fix переписан: решение «тёмное ли фото» и сила подъёма теперь
+        считаются по теням (20-й процентиль яркости), а не по медиане, и
+        используется кривая подъёма теней вместо общей гаммы. Раньше кадр с
+        тёмным передним планом под светлым небом (медиана ~89) в «авто»
+        пропускался, а в «всегда» подъём был почти незаметен.
 - v5.18: при включённой чистке метаданных фото с тегом EXIF Orientation
         физически поворачиваются до чистки (exiftool -all= удаляет этот тег,
         и вертикальные кадры иначе ложились бы на бок). JPEG пересохраняется
@@ -242,7 +247,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.18"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.19"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -1137,7 +1142,7 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         note += f"\n↻ Повернул {rotated_count} фото в нормальное положение (иначе после чистки метаданных они лежали бы на боку)."
     if settings["photo_fix"] in ("auto", "always"):
         note += (f"\n🌗 Подправил яркость: {edited_count} из {len(items)}"
-                 if edited_count else "\n🌗 Коррекция включена, но подправлять было нечего.")
+                 if edited_count else "\n🌗 Коррекция включена, но кадры не показались тёмными — не трогал (режим «всегда» подсветит любые).")
 
     if settings["auto_date_folder"]:
         folder_name = _pick_folder_date(exif_dates, messages).strftime("%d.%m.%y")
