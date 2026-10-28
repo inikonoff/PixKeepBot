@@ -4,13 +4,33 @@ active), upload history ("Мои загрузки") and the keep-alive ping.
 Full schema and migrations: README.md ("Supabase").
 """
 import asyncio
+import functools
 import logging
 
-from supabase import create_client
+from supabase import Client, create_client
 
-from config import config
+from pixkeep.config import config
 
-_supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+_client: Client | None = None
+
+
+def _sb() -> Client:
+    """The Supabase client, created on first use (so importing this module
+    needs no network and no credentials, e.g. in tests)."""
+    global _client
+    if _client is None:
+        _client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return _client
+
+
+def _in_thread(fn):
+    """supabase-py is synchronous: every query is a blocking HTTP call. Run it
+    in a worker thread so the bot's event loop never stalls on the database.
+    Every public function below is therefore awaited by callers."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return wrapper
 
 DEFAULT_SETTINGS = {
     "clean_metadata": True,
@@ -23,13 +43,14 @@ DEFAULT_SETTINGS = {
 
 
 # --------------------------------------------------------------- settings ---
+@_in_thread
 def get_settings(telegram_id: int) -> dict:
     # Select columns built from DEFAULT_SETTINGS.keys() on purpose — adding a
     # new setting there automatically includes it here too, so this can't
     # silently go stale again the way it did with auto_date_folder.
     columns = ", ".join(DEFAULT_SETTINGS.keys())
     resp = (
-        _supabase.table("user_settings")
+        _sb().table("user_settings")
         .select(columns)
         .eq("telegram_id", telegram_id)
         .limit(1)
@@ -44,25 +65,27 @@ def get_settings(telegram_id: int) -> dict:
     }
 
 
+@_in_thread
 def set_setting(telegram_id: int, field: str, value) -> None:
     if field not in DEFAULT_SETTINGS:
         raise ValueError(f"Unknown setting: {field}")
-    _supabase.table("user_settings").upsert({
+    _sb().table("user_settings").upsert({
         "telegram_id": telegram_id,
         field: value,
     }).execute()
 
 
 # ---------------------------------------------------------- Google accounts --
+@_in_thread
 def add_or_update_account(telegram_id: int, email: str,
                           access_token: str, refresh_token: str) -> None:
     """Connect a new Google account, or refresh tokens if this email is
     already connected for this Telegram user. Either way, this account
     becomes the active one (deactivating any others)."""
-    _supabase.table("google_accounts").update({"is_active": False}).eq(
+    _sb().table("google_accounts").update({"is_active": False}).eq(
         "telegram_id", telegram_id
     ).execute()
-    _supabase.table("google_accounts").upsert({
+    _sb().table("google_accounts").upsert({
         "telegram_id": telegram_id,
         "email": email,
         "access_token": access_token,
@@ -71,9 +94,10 @@ def add_or_update_account(telegram_id: int, email: str,
     }, on_conflict="telegram_id,email").execute()
 
 
+@_in_thread
 def list_accounts(telegram_id: int) -> list[dict]:
     resp = (
-        _supabase.table("google_accounts")
+        _sb().table("google_accounts")
         .select("id, email, is_active")
         .eq("telegram_id", telegram_id)
         .order("created_at")
@@ -82,9 +106,10 @@ def list_accounts(telegram_id: int) -> list[dict]:
     return resp.data or []
 
 
+@_in_thread
 def get_active_account(telegram_id: int) -> dict | None:
     resp = (
-        _supabase.table("google_accounts")
+        _sb().table("google_accounts")
         .select("id, email, access_token, refresh_token")
         .eq("telegram_id", telegram_id)
         .eq("is_active", True)
@@ -96,30 +121,34 @@ def get_active_account(telegram_id: int) -> dict | None:
     return None
 
 
+@_in_thread
 def set_active_account(telegram_id: int, account_id: int) -> None:
-    _supabase.table("google_accounts").update({"is_active": False}).eq(
+    _sb().table("google_accounts").update({"is_active": False}).eq(
         "telegram_id", telegram_id
     ).execute()
-    _supabase.table("google_accounts").update({"is_active": True}).eq(
+    _sb().table("google_accounts").update({"is_active": True}).eq(
         "id", account_id
     ).eq("telegram_id", telegram_id).execute()
 
 
+@_in_thread
 def update_account_tokens(account_id: int, access_token: str, refresh_token: str) -> None:
-    _supabase.table("google_accounts").update({
+    _sb().table("google_accounts").update({
         "access_token": access_token,
         "refresh_token": refresh_token,
     }).eq("id", account_id).execute()
 
 
+@_in_thread
 def remove_all_accounts(telegram_id: int) -> None:
-    _supabase.table("google_accounts").delete().eq("telegram_id", telegram_id).execute()
-    _supabase.table("uploads").delete().eq("telegram_id", telegram_id).execute()
+    _sb().table("google_accounts").delete().eq("telegram_id", telegram_id).execute()
+    _sb().table("uploads").delete().eq("telegram_id", telegram_id).execute()
 
 
+@_in_thread
 def get_account_by_id(telegram_id: int, account_id: int) -> dict | None:
     resp = (
-        _supabase.table("google_accounts")
+        _sb().table("google_accounts")
         .select("id, email, access_token, refresh_token")
         .eq("telegram_id", telegram_id)
         .eq("id", account_id)
@@ -133,11 +162,12 @@ def get_account_by_id(telegram_id: int, account_id: int) -> dict | None:
 UPLOADS_KEEP = 20  # rows kept per user; older ones are pruned on insert
 
 
+@_in_thread
 def save_upload(telegram_id: int, account_id: int, folder_id: str,
                 folder_name: str, link: str, files: list[dict]) -> int | None:
     """files: [{"id": drive_file_id, "name": uploaded_name}, ...]
     Returns the new row's id."""
-    resp = _supabase.table("uploads").insert({
+    resp = _sb().table("uploads").insert({
         "telegram_id": telegram_id,
         "account_id": account_id,
         "folder_id": folder_id,
@@ -147,7 +177,7 @@ def save_upload(telegram_id: int, account_id: int, folder_id: str,
     }).execute()
     new_id = resp.data[0]["id"] if resp.data else None
     old = (
-        _supabase.table("uploads").select("id")
+        _sb().table("uploads").select("id")
         .eq("telegram_id", telegram_id)
         .is_("comment", "null")
         .order("created_at", desc=True)
@@ -156,13 +186,14 @@ def save_upload(telegram_id: int, account_id: int, folder_id: str,
     )
     ids = [r["id"] for r in (old.data or [])]
     if ids:
-        _supabase.table("uploads").delete().in_("id", ids).execute()
+        _sb().table("uploads").delete().in_("id", ids).execute()
     return new_id
 
 
+@_in_thread
 def list_uploads(telegram_id: int, limit: int = 10) -> list[dict]:
     resp = (
-        _supabase.table("uploads").select("*")
+        _sb().table("uploads").select("*")
         .eq("telegram_id", telegram_id)
         .order("created_at", desc=True)
         .limit(limit)
@@ -171,27 +202,31 @@ def list_uploads(telegram_id: int, limit: int = 10) -> list[dict]:
     return resp.data or []
 
 
+@_in_thread
 def get_upload(telegram_id: int, upload_id: int) -> dict | None:
     resp = (
-        _supabase.table("uploads").select("*")
+        _sb().table("uploads").select("*")
         .eq("telegram_id", telegram_id).eq("id", upload_id)
         .limit(1).execute()
     )
     return resp.data[0] if resp.data else None
 
 
+@_in_thread
 def update_upload(telegram_id: int, upload_id: int, **fields) -> None:
-    _supabase.table("uploads").update(fields).eq(
+    _sb().table("uploads").update(fields).eq(
         "telegram_id", telegram_id).eq("id", upload_id).execute()
 
 
+@_in_thread
 def delete_upload(telegram_id: int, upload_id: int) -> None:
-    _supabase.table("uploads").delete().eq(
+    _sb().table("uploads").delete().eq(
         "telegram_id", telegram_id).eq("id", upload_id).execute()
 
 
+@_in_thread
 def delete_uploads_by_folder(telegram_id: int, folder_id: str) -> None:
-    _supabase.table("uploads").delete().eq(
+    _sb().table("uploads").delete().eq(
         "telegram_id", telegram_id).eq("folder_id", folder_id).execute()
 
 
@@ -202,7 +237,7 @@ KEEPALIVE_INTERVAL_SECONDS = 10 * 60
 
 
 def _ping_sync() -> None:
-    _supabase.table("user_settings").select("telegram_id").limit(1).execute()
+    _sb().table("user_settings").select("telegram_id").limit(1).execute()
 
 
 async def keep_alive_loop(interval: int = KEEPALIVE_INTERVAL_SECONDS) -> None:
@@ -219,10 +254,11 @@ async def keep_alive_loop(interval: int = KEEPALIVE_INTERVAL_SECONDS) -> None:
         await asyncio.sleep(interval)
 
 
+@_in_thread
 def list_uploads_by_folder(telegram_id: int, folder_id: str) -> list[dict]:
     """All history rows for one Drive folder, oldest first."""
     resp = (
-        _supabase.table("uploads").select("*")
+        _sb().table("uploads").select("*")
         .eq("telegram_id", telegram_id).eq("folder_id", folder_id)
         .order("created_at")
         .execute()
@@ -230,11 +266,13 @@ def list_uploads_by_folder(telegram_id: int, folder_id: str) -> list[dict]:
     return resp.data or []
 
 
+@_in_thread
 def set_folder_comment_file(telegram_id: int, folder_id: str, file_id: str | None) -> None:
-    _supabase.table("uploads").update({"comment_file_id": file_id}).eq(
+    _sb().table("uploads").update({"comment_file_id": file_id}).eq(
         "telegram_id", telegram_id).eq("folder_id", folder_id).execute()
 
 
+@_in_thread
 def rename_folder_rows(telegram_id: int, folder_id: str, new_name: str) -> None:
-    _supabase.table("uploads").update({"folder_name": new_name}).eq(
+    _sb().table("uploads").update({"folder_name": new_name}).eq(
         "telegram_id", telegram_id).eq("folder_id", folder_id).execute()
