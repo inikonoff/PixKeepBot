@@ -88,21 +88,21 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         batch = await prepare_batch(refs, settings, work_dir)
 
     if not batch.items:
-        await bot.send_message(chat_id, texts.nothing_received(batch.skipped))
+        await bot.send_message(chat_id, texts.nothing_received(batch.skipped), parse_mode="HTML")
         shutil.rmtree(work_dir, ignore_errors=True)
         return
 
     note = texts.intake_note(batch, settings)
     if settings["auto_date_folder"]:
         folder_name = pick_folder_date(batch.exif_dates, [r.date for r in refs]).strftime("%d.%m.%y")
-        await bot.send_message(chat_id, note + texts.auto_folder_line(folder_name))
+        await bot.send_message(chat_id, note + texts.auto_folder_line(folder_name, bool(batch.exif_dates)), parse_mode="HTML")
         await deliver(chat_id, telegram_id, batch.items, work_dir, folder_name)
         return
 
     if await state.get_state() == Flow.waiting_folder_name.state:
         folder_name_queue.setdefault(chat_id, []).append(
             {"items": batch.items, "work_dir": work_dir, "note": note})
-        await bot.send_message(chat_id, note + texts.queued_line())
+        await bot.send_message(chat_id, note + texts.queued_line(), parse_mode="HTML")
         return
 
     await _ask_folder_name(chat_id, state, batch.items, work_dir, note)
@@ -145,7 +145,7 @@ async def _ask_folder_name(chat_id: int, state: FSMContext, items: list[dict],
     kb_rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"fld:{i}")]
                for i, n in enumerate(names)]
     kb_rows.append([InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")])
-    await bot.send_message(chat_id, note + texts.ask_folder_line(),
+    await bot.send_message(chat_id, note + texts.ask_folder_line(), parse_mode="HTML",
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 

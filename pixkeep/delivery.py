@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 
-from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from pixkeep import db, texts
 from pixkeep.config import config
@@ -189,11 +189,11 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
         q = await account_quota(account)
         if q and q[1] and q[0] + total_size > q[1]:
             await bot.send_message(chat_id, texts.quota_warning(
-                account["email"], max(q[1] - q[0], 0), total_size))
+                account["email"], max(q[1] - q[0], 0), total_size), parse_mode="HTML")
     except Exception:
         logging.exception("quota pre-check failed")
 
-    status = await bot.send_message(chat_id, texts.uploading(folder_name, 0, len(items)))
+    status = await bot.send_message(chat_id, texts.uploading(folder_name, 0, len(items)), parse_mode="HTML")
     last_edit = [0.0]
 
     async def on_progress(done: int, total: int) -> None:
@@ -202,7 +202,7 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
             return
         last_edit[0] = now
         with contextlib.suppress(Exception):
-            await status.edit_text(texts.uploading(folder_name, done, total))
+            await status.edit_text(texts.uploading(folder_name, done, total), parse_mode="HTML")
 
     async def _drop_status() -> None:
         with contextlib.suppress(Exception):
@@ -227,7 +227,7 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
     except Exception as e:
         logging.exception("upload failed")
         await _drop_status()
-        await bot.send_message(chat_id, f"Ошибка при загрузке: {e}")
+        await bot.send_message(chat_id, texts.upload_error(e), parse_mode="HTML")
         _cleanup()
         return
     await _drop_status()
@@ -280,7 +280,8 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
         keep_dir = True
         rows.append([InlineKeyboardButton(
             text=f"🔁 Повторить неудачные ({len(failed)})", callback_data=f"retry:{token}")])
-    await bot.send_message(chat_id, report,
+    await bot.send_message(chat_id, report, parse_mode="HTML",
+                           link_preview_options=LinkPreviewOptions(is_disabled=True),
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
     # Delete source messages only for files that are on Drive, plainly, so the
@@ -293,11 +294,7 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
             logging.warning(f"couldn't delete message {r['message_id']}: {e}")
             not_deleted += 1
     if not_deleted:
-        await bot.send_message(
-            chat_id,
-            f"🗑 Не смог удалить {not_deleted} исходных сообщени(й) из чата — "
-            "обычно если прошло слишком много времени, удали вручную при желании.",
-        )
+        await bot.send_message(chat_id, texts.messages_not_deleted(not_deleted), parse_mode="HTML")
 
     if not keep_dir:
         _cleanup()

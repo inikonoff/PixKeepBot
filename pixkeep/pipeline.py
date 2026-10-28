@@ -95,6 +95,7 @@ async def prepare_batch(refs: list[MediaRef], settings: dict, work_dir: str) -> 
                 "message_id": ref.message_id,
                 "path": path,
                 "orig_name": os.path.basename(path),
+                "kind": ref.kind,
             })
     items = batch.items
     if not items:

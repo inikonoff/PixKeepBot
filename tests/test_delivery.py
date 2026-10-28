@@ -25,8 +25,10 @@ def test_same_name_same_content_still_skipped_with_replace():
 
 def test_fmt_bytes_and_quota():
     assert fmt_bytes(512) == "512 Б"
-    assert fmt_bytes(184 * 1024 ** 2) == "184,0 МБ"
-    assert quota_label((184 * 1024 ** 2, 15 * 1024 ** 3)) == "184,0 МБ из 15,0 ГБ"
+    assert fmt_bytes(184 * 1024 ** 2) == "184 МБ"
+    assert fmt_bytes(1.5 * 1024 ** 3) == "1,5 ГБ"
+    assert fmt_bytes(2.04 * 1024 ** 2) == "2 МБ"
+    assert quota_label((184 * 1024 ** 2, 15 * 1024 ** 3)) == "184 МБ из 15 ГБ"
     assert quota_label(None) == "?"
 
 

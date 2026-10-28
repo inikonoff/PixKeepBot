@@ -27,10 +27,12 @@ def test_photo_uses_largest_size():
     assert ref.kind == "photo" and ref.file_id == "fid-big"
 
 
-def test_nameless_media_get_stable_names():
+def test_nameless_media_get_stable_readable_names():
     a = MediaRef.from_message(_msg(voice=_file("V1")))
     b = MediaRef.from_message(_msg(voice=_file("V1")))
-    assert a.name == b.name and a.name.endswith(".ogg")
+    assert a.name == b.name == "voice_2026-10-28_22-09-01.ogg"     # 19:09 UTC = 22:09 Minsk
+    photo = MediaRef.from_message(_msg(photo=[_file("P")]))
+    assert photo.name == "photo_2026-10-28_22-09-01.jpg"
 
 
 def test_path_in_document_name_is_stripped():
