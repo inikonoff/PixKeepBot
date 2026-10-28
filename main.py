@@ -20,8 +20,8 @@ from aiogram.filters import BaseFilter
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
+from pixkeep import db
 from pixkeep.config import config
-from pixkeep.db import keep_alive_loop
 from pixkeep.handlers import routers
 from pixkeep.runtime import bot
 from pixkeep.web import run_web
@@ -63,9 +63,18 @@ async def main():
     shutil.rmtree(config.TEMP_DIR, ignore_errors=True)   # leftovers of a previous run
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     dp = build_dispatcher()
+    if config.TOKEN_KEY:
+        try:
+            n = await db.encrypt_existing_tokens()
+            if n:
+                logging.info(f"encrypted Google tokens of {n} account(s)")
+        except Exception:
+            logging.exception("token encryption migration failed (will retry on next start)")
+    else:
+        logging.warning("TOKEN_KEY is not set: Google tokens are stored unencrypted")
     await bot.set_my_commands(BOT_COMMANDS)
     await run_web()
-    keepalive_task = asyncio.create_task(keep_alive_loop())
+    keepalive_task = asyncio.create_task(db.keep_alive_loop())
     try:
         await dp.start_polling(bot)
     finally:

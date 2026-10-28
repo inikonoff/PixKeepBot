@@ -182,6 +182,12 @@ alter table uploads add column if not exists comment_file_id text;
 - `OAUTH_REDIRECT_URI` = `https://<твой-домен>.onrender.com/oauth/callback`
   (ровно как в Google Cloud Console)
 - `SUPABASE_URL`, `SUPABASE_KEY`
+- `TOKEN_KEY` (желательно) — любая длинная случайная строка, например из
+  менеджера паролей (40+ символов). С ней токены Google хранятся в Supabase
+  зашифрованными; уже сохранённые бот зашифрует сам при старте. **Не меняй и
+  не теряй её:** без прежнего ключа токены не расшифровать — придётся
+  `/logout` и подключить аккаунты заново. Без `TOKEN_KEY` токены хранятся
+  открытым текстом, как раньше.
 
 `PORT` Render задаёт сам; на нём работают OAuth-callback и `/health`.
 

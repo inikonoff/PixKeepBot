@@ -2,3 +2,4 @@ aiogram==3.31.0
 aiohttp==3.14.5
 supabase==2.33.0
 Pillow==12.3.0
+cryptography==50.0.2

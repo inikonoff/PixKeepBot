@@ -9,6 +9,7 @@ import logging
 
 from supabase import Client, create_client
 
+from pixkeep import crypto
 from pixkeep.config import config
 
 _client: Client | None = None
@@ -88,8 +89,8 @@ def add_or_update_account(telegram_id: int, email: str,
     _sb().table("google_accounts").upsert({
         "telegram_id": telegram_id,
         "email": email,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "access_token": crypto.encrypt(access_token),
+        "refresh_token": crypto.encrypt(refresh_token),
         "is_active": True,
     }, on_conflict="telegram_id,email").execute()
 
@@ -116,9 +117,7 @@ def get_active_account(telegram_id: int) -> dict | None:
         .limit(1)
         .execute()
     )
-    if resp.data:
-        return resp.data[0]
-    return None
+    return _decrypted(resp.data[0]) if resp.data else None
 
 
 @_in_thread
@@ -134,8 +133,8 @@ def set_active_account(telegram_id: int, account_id: int) -> None:
 @_in_thread
 def update_account_tokens(account_id: int, access_token: str, refresh_token: str) -> None:
     _sb().table("google_accounts").update({
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "access_token": crypto.encrypt(access_token),
+        "refresh_token": crypto.encrypt(refresh_token),
     }).eq("id", account_id).execute()
 
 
@@ -155,7 +154,31 @@ def get_account_by_id(telegram_id: int, account_id: int) -> dict | None:
         .limit(1)
         .execute()
     )
-    return resp.data[0] if resp.data else None
+    return _decrypted(resp.data[0]) if resp.data else None
+
+
+def _decrypted(row: dict) -> dict:
+    return {**row, "access_token": crypto.decrypt(row["access_token"]),
+            "refresh_token": crypto.decrypt(row["refresh_token"])}
+
+
+@_in_thread
+def encrypt_existing_tokens() -> int:
+    """Startup migration: encrypts tokens still stored as plaintext (rows
+    written before TOKEN_KEY was set). Returns how many rows were updated."""
+    if not config.TOKEN_KEY:
+        return 0
+    rows = _sb().table("google_accounts").select("id, access_token, refresh_token").execute().data or []
+    n = 0
+    for r in rows:
+        if crypto.is_encrypted(r["access_token"]) and crypto.is_encrypted(r["refresh_token"]):
+            continue
+        _sb().table("google_accounts").update({
+            "access_token": crypto.encrypt(r["access_token"]),
+            "refresh_token": crypto.encrypt(r["refresh_token"]),
+        }).eq("id", r["id"]).execute()
+        n += 1
+    return n
 
 
 # ------------------------------------------------------------------ uploads --
