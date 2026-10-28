@@ -1,18 +1,5 @@
 """
-config.py
-v5.0 - central configuration (Google Drive backend, multi-account, admin-only access)
-
-Changelog:
-- v5.26: ADMIN_IDS (comma-separated, ADMIN_ID still works), MAX_BATCH_MB.
-- v5.0: added ADMIN_ID — only this Telegram user ID can use the bot at all.
-        Everyone else is silently ignored at the dispatcher level, before
-        any handler (including /start) even runs.
-- v4.1: added userinfo.email scope for multi-account support (need email
-        to label accounts in /accounts).
-- v4.0: switched storage backend Yandex.Disk -> Google Drive (drive.file
-        scope, non-sensitive, app published "In Production" so no 100-user
-        cap and no 7-day refresh-token expiry).
-- v3.0: Yandex.Disk backend (accessible from BY/CIS).
+Central configuration from environment variables (see README.md, "Render").
 """
 import os
 

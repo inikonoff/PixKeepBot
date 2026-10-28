@@ -1,285 +1,17 @@
 """
-main.py
-v5.25 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
-
-Changelog (полный список по версиям — в CHANGELOG.md):
-- v5.25: пропуск дубликатов больше не мешает «Заменять файлы с таким же именем»:
-        если файл с этим именем уже есть, но с другим содержимым, новая версия
-        заменяет его, даже если такие же байты лежат в папке под другим именем.
-- v5.24: строка про пропущенные дубликаты в отчёте сокращена: «♻️ Пропущено
-        как дубликаты (N): имена через запятую» — без «= другой файл» в скобках.
-- v5.23: (1) свободное место по аккаунтам в /accounts, предупреждение перед
-        загрузкой и строка «💾 занято» в отчёте (Drive about.get; при отказе
-        Google — «?»); (2) пропуск дубликатов по md5 (внутри пачки и в
-        папке); (3) подсказки папок кнопками под вопросом об имени;
-        (4) прогресс «N/M» и «🔁 Повторить неудачные» (файлы хранятся 30 мин);
-        (5) «Мои загрузки»: переименовать папку, прислать файл в чат (до 50 МБ);
-        при старте очищается TEMP_DIR.
-- v5.22: в /accounts под списком аккаунтов добавлена кнопка «➕ Добавить аккаунт».
-- v5.21: приём ЛЮБЫХ файлов — теперь принимаются и видео, аудио, голосовые,
-        кружки и GIF (раньше только фото и документы; остальное молча
-        игнорировалось). Исправлено: (1) один не скачавшийся файл (напр.
-        больше 20 МБ — лимит Bot API) ронял всю пачку без единого сообщения;
-        теперь такие файлы перечисляются в отчёте, остальные грузятся, а
-        исходные сообщения непринятых файлов остаются в чате; (2) файлы с
-        одинаковым именем в одной пачке перезаписывали друг друга на диске
-        (и оба исходных сообщения удалялись) — теперь получают суффикс _2,
-        _3; (3) если exiftool не смог почистить файл, бот молча заливал его
-        как есть — теперь предупреждает в сообщении и помечает в txt-списке.
-- v5.20: комментарии к папке: кнопка «💬 Добавить комментарий» под отчётом
-        о загрузке и в карточке загрузки («Мои загрузки»). Текст сохраняется
-        в !COMMENT.txt (имя начинается с «!», чтобы файл был первым в списке)
-        — один файл на папку, комментарии дописываются с меткой времени.
-        Комментарий можно удалить из «Мои загрузки». REQUIRES две новые
-        колонки в uploads — SQL в README и в db.py.
-- v5.19: photo_fix переписан: решение «тёмное ли фото» и сила подъёма теперь
-        считаются по теням (20-й процентиль яркости), а не по медиане, и
-        используется кривая подъёма теней вместо общей гаммы. Раньше кадр с
-        тёмным передним планом под светлым небом (медиана ~89) в «авто»
-        пропускался, а в «всегда» подъём был почти незаметен.
-- v5.18: при включённой чистке метаданных фото с тегом EXIF Orientation
-        физически поворачиваются до чистки (exiftool -all= удаляет этот тег,
-        и вертикальные кадры иначе ложились бы на бок). JPEG пересохраняется
-        с quality 95; в txt-списке такие файлы помечены "rotated upright".
-- v5.17: (1) автокоррекция тёмных фото (photo_fix.py; /settings: выкл / авто /
-        всегда) — только JPEG/PNG, перед чисткой метаданных; (2) настройка
-        «txt-список файлов»: в папку кладётся upload_list_<дата>.txt (на
-        английском, UTF-8 с BOM) с пометкой edited/original по каждому файлу;
-        (3) бот везде называется PixKeep. REQUIRES две новые колонки в
-        user_settings — SQL в README и в db.py.
-- v5.16: «Мои загрузки» — удаление отдельных файлов из загрузки (список с
-        постраничной навигацией; последний удалённый файл убирает и пустую
-        папку, как полное удаление).
-- v5.15: "📂 Мои загрузки" (кнопка под полем ввода + /uploads): последние 10
-        загрузок, по каждой — открыть/скопировать ссылку, закрыть/открыть
-        доступ по ссылке, удалить (файлы и пустая папка уходят в корзину
-        Drive). REQUIRES table `uploads` in Supabase — SQL in README.
-- v5.14: Supabase keep-alive — background task (db.keep_alive_loop) pings the
-        database every 10 min so the free project is not paused for inactivity.
-- v5.13: removed the TYPING chat-action v5.12 wrapped around message
-        deletion. There's no "done" chat-action to end on (Bot API's
-        action vocabulary is entirely in-progress states — typing,
-        uploading, recording, etc. — nothing means "finished"), so all it
-        actually did was flash "печатает..." right after the upload report
-        and then silently stop, which read as unfinished rather than
-        reassuring. Deletion runs plainly now; the upload report is simply
-        the last thing in the chat, nothing flickers after it.
-- v5.12: the upload flow used to always end with a routine "🗑 Удалил N
-        исходных сообщений из чата" text message AFTER the "✅ Загружено...
-        ссылка" report — so the link/report was never actually the last
-        thing visible in the chat. Deleting the original messages now just
-        runs under the same TYPING chat-action indicator as the rest of the
-        pipeline (v5.11) instead of narrating itself with its own message.
-        A text message only appears afterward if something genuinely needs
-        attention — a handful of messages Telegram wouldn't let get deleted
-        (e.g. too old) — since that's information the person has to act on,
-        not a routine confirmation. When everything deletes cleanly (the
-        normal case), the upload report stays the last word in the chat.
-- v5.11: moved the "still working" indicator (v5.9) out of the chat log and
-        into Telegram's native chat-action line — the "бот отправляет
-        файл..." text that shows right under the chat title, the same spot
-        Telegram's own service notices ("Connecting...") show up. v5.9 sent
-        random filler text messages into the conversation itself to prove
-        the bot hadn't stalled; those are gone now in favor of
-        bot.send_chat_action, re-sent every 4s (a chat action only holds
-        for ~5s before Telegram clears it) for as long as the wrapped work
-        runs, then left to disappear on its own — nothing to clean up.
-        Same two spots as before (download+exif+clean in _process, the
-        Drive upload in _do_upload), just a different action type per spot
-        since Bot API's fixed action vocabulary has no generic "processing"
-        option: TYPING for the first, UPLOAD_DOCUMENT (the default) for the
-        second.
-- v5.10: added a "♻️ Заменять файлы с таким же именем" setting
-        (replace_duplicates, /settings — off by default, so nobody's
-        existing behavior changes unless they opt in). Google Drive treats
-        filenames as plain metadata, not a unique path — uploading a file
-        called IMG_1234.jpg into a folder that already has one just creates
-        a second object with the same name, no error, no warning. With this
-        on, upload now checks the target folder for a file with that exact
-        name first (find_file_in_folder) and overwrites its content in
-        place (replace_file_content) instead of creating a duplicate —
-        same file id, same share link. Matching is by name only within the
-        target folder, not by content hash, so this is specifically for
-        "I re-sent the same file/named it the same" rather than true
-        content-dedup.
-        REQUIRES a Supabase migration before deploying — see db.py's
-        header (ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS
-        replace_duplicates boolean default false;) — get_settings() builds
-        its SELECT from DEFAULT_SETTINGS.keys(), so without that column
-        every call (including the one behind every single upload) errors
-        out until the migration runs.
-- v5.9: added a "heartbeat" — a background ping every 6s with a random
-        working-on-it phrase (see HEARTBEAT_MESSAGES) — wrapped around the
-        two stretches of the pipeline that can run long with literally
-        nothing printed to the chat: download-from-Telegram + exiftool
-        inspect/clean in _process, and the actual Drive upload in
-        _do_upload. Purely cosmetic/reassurance — the messages don't need
-        to (and don't) describe the exact operation running at that instant,
-        they just prove the bot hasn't silently died on a big or slow
-        batch. Implemented as an async context manager (_heartbeat) so it
-        starts/stops correctly via try/finally regardless of whether the
-        wrapped code finishes normally, raises, or (in principle) gets
-        cancelled — no separate bookkeeping needed at each call site.
-- v5.8: added a "📋 Скопировать ссылку" button under the final upload report,
-        using Telegram's copy_text inline-button type (Bot API 7.x+,
-        aiogram's CopyTextButton) — tapping it puts the Drive link straight
-        on the clipboard. The link in the message text is still a normal
-        tappable URL that opens the folder; this is purely additive, since
-        Telegram gives a plain URL exactly one tap behavior (open) and
-        there's no way to make that same tap also copy.
-- v5.7: replaced the two separate, uncoordinated batch-collection mechanisms
-        (one waiting a flat 1s for an album's remaining media_group_id
-        messages, one debouncing individually-sent files with no
-        media_group_id) with a single per-chat buffer + one silence timer
-        (BATCH_SILENCE_SECONDS, still 4.0s). Every incoming photo/document
-        for a chat — album or not, whichever album — now goes into the same
-        list and resets the same timer; processing starts once nothing new
-        has arrived for BATCH_SILENCE_SECONDS. This is the real fix for the
-        "Получил 2 файл(ов)" / "Получил 9 файл(ов)" double-prompt: Telegram
-        caps albums at 10 items, so sending 11 photos gets split client-side
-        into a 10-item and a 1-item media group with two different
-        media_group_id values, arriving moments apart — the old code had no
-        way to know they were part of the same user action and processed
-        them as two unrelated batches. Now, as long as the split pieces
-        arrive within the same silence window (which they normally do,
-        being one client-side send), they're collected and processed
-        together as a single batch with a single folder-name question.
-        folder_name_queue (v5.6) and chat_locks (v5.5) are both kept as
-        fallbacks — they still matter if a burst is large/slow enough to
-        genuinely produce two separate silence windows.
-- v5.6: fixed a second, separate bug behind the same symptom as v5.5's
-        "10 + 1" case: Telegram itself splits any send of 11+ photos into
-        separate media groups (a hard 10-item album cap, nothing this bot
-        can do about that) — so with auto_date_folder OFF, both batches'
-        _process() calls reached the manual "укажите имя папки" prompt in
-        quick succession. That prompt stores its batch's items/work_dir in
-        FSM state and waits for a text reply — but FSM state is per chat,
-        not per batch, so the second batch's state.update_data() silently
-        overwrote the first batch's before its question could be answered:
-        whichever name got typed only applied to the last batch, and the
-        earlier one's downloaded files were orphaned (never uploaded, temp
-        dir never cleaned up). Two "Укажите имя папки" prompts appearing
-        back-to-back, before there was time to answer either, was the
-        visible symptom. Fixed with a small per-chat queue
-        (folder_name_queue): if a batch reaches the manual-name prompt while
-        another one is already waiting on FSM state, it's queued instead of
-        overwriting that state, and gets its own prompt once the batch ahead
-        of it is answered (on_folder_name) or cancelled (on_cancel) — both
-        now run under the same chat_locks lock from v5.5, so a newly
-        arriving batch's _process() can't check-and-overwrite FSM state in
-        the middle of that handoff either.
-- v5.5: fixed a batch-splitting/duplicate-folder bug: a burst of ~10+ files
-        sent close together (esp. over a slow/unstable connection) could get
-        chopped into several smaller batches — either because the singles
-        debounce (v3.2) timed out between arrivals, or because a real
-        media-group and a singles-burst landed in the same chat at once.
-        Each batch ran _process()/_do_upload() as an independent asyncio
-        task with no coordination between them, so two batches could both
-        call ensure_folder() for the SAME auto-date folder name concurrently
-        — both search, both find nothing yet (the other hasn't created it
-        yet), both create a folder, and you end up with two distinct Drive
-        folders sharing the same name and only some of the files in each.
-        Fixed by serializing all batch processing per chat behind a lock
-        (_get_chat_lock): a new batch (whether from _finish_singles or
-        _finish_group) now waits for any batch already in flight for that
-        chat to fully finish (download → clean → upload → report → delete)
-        before starting. This doesn't stop a burst from still being split
-        into multiple batches (see SINGLES_DEBOUNCE_SECONDS below), but it
-        guarantees those batches run strictly one after another, so the
-        second one's ensure_folder() call will always find the folder the
-        first one already created instead of racing to make a duplicate.
-        Also raised SINGLES_DEBOUNCE_SECONDS 2.0 -> 4.0 to reduce how often
-        a slow upload from the phone (weak signal, large files) creates a
-        >2s gap between messages and triggers a premature split in the
-        first place.
-- v5.26: Drive retries with backoff (429/5xx/network), OAuth state TTL and HTML
-        result page, "access revoked" message with a reconnect button, per-batch
-        size cap (MAX_BATCH_MB), /help, ADMIN_IDS.
-- v5.4: added /version — replies with the running code's version string.
-        Added purely as a deployment diagnostic: several rounds of "the
-        feature isn't there" turned out to be Render still running an old
-        deploy, indistinguishable from an actual code bug without a way to
-        ask the running instance what it actually is. Check /version after
-        every deploy going forward.
-- v5.3: added auto_date_folder setting (/settings, third checkbox). When on,
-        the bot skips the "укажите имя папки" text prompt entirely: it reads
-        each file's EXIF capture date (falling back to the Telegram message's
-        send time, then to today, if no EXIF date is present), picks one date
-        for the whole batch (most common; ties go to the earliest), announces
-        "Папка будет создана автоматически: DD.MM.YY", and uploads right away
-        — no confirmation click, matching the "remove friction" goal from
-        /settings itself. GPS/date extraction reuses the same exiftool pass
-        already done for the GPS warning, no extra subprocess calls added.
-        Upload+report+cleanup logic extracted into _do_upload() shared by
-        both this path and the manual on_folder_name handler.
-- v5.2: fixed the long freeze after sending files. Root cause: exiftool
-        calls (inspect_metadata / strip_exif) are blocking OS subprocess
-        calls; running them directly in an async handler froze the ENTIRE
-        bot (no other updates processed) for the full duration. Now offloaded
-        via asyncio.to_thread, and downloads / exif calls / Drive uploads all
-        run concurrently (bounded by semaphores — DOWNLOAD_CONCURRENCY,
-        EXIF_CONCURRENCY, UPLOAD_CONCURRENCY) instead of strictly one-by-one.
-        Also added a Telegram command menu (the blue "menu" button) via
-        bot.set_my_commands() at startup, listing /start /accounts /settings
-        /logout.
-- v5.1: added a global IsAdmin filter (dp.message.filter / dp.callback_query.filter)
-        so ONLY config.ADMIN_ID can interact with the bot at all — anyone else's
-        messages are dropped before reaching any handler, silently. This closes
-        the "any stranger who finds the bot can connect their own Google
-        account and use our infra/quota" exposure raised earlier.
-- v5.0: multiple Google accounts per Telegram user. /start now offers
-        "add another account" once one is connected; /accounts lists all
-        connected accounts and lets you tap one to make it active (that's
-        the one uploads go to). Any Google account can connect — not just
-        the one that created the OAuth client — since the app is Published
-        (In Production) with a non-sensitive scope, so there's no test-user
-        allow-list. Settings (clean/anonymize) are now independent of which
-        account is active — one set of preferences per Telegram user.
-- v4.1: moved "чистить метаданные?" / "обезличить имена?" out of the
-        per-upload flow and into standing settings, toggled anytime via
-        /settings (checkboxes, persisted in Supabase). The upload flow is
-        now just: files -> folder name -> link. Settings are applied
-        automatically and silently (the note before the folder-name prompt
-        just states what will happen, doesn't ask).
-- v4.0: storage backend Yandex.Disk -> Google Drive. Reason: Yandex forces
-        login for public FOLDER links (only individual files are login-free
-        by design), which broke the "anyone with the link, no auth" goal.
-        Google Drive's "anyone with the link" folder sharing has no such
-        restriction. Uses drive.file scope (non-sensitive) via plain REST
-        (aiohttp), no Google client libraries needed. App is published
-        "In Production" so there's no 100-test-user cap and (to be
-        confirmed over the coming week) no 7-day refresh-token expiry.
-- v3.5: reverted /space (v3.4) — confirmed live that GET /v1/disk returns
-        403 under cloud_api:disk.app_folder scope. Showing quota would
-        require broadening to a whole-disk read scope, which isn't worth
-        trading away the "bot only sees its own folder" guarantee. Back to
-        app_folder-only, no disk-quota command.
-- v3.3: added a "❌ Отменить загрузку" button at every step (clean choice,
-        rename choice, folder-name prompt). Cancelling wipes any downloaded/
-        cleaned temp files and clears FSM state — nothing gets uploaded.
-- v3.2: fixed batching for files sent as separate messages (no shared
-        media_group_id) — some Telegram clients send multi-file "as
-        document" uploads this way instead of a real album. Now buffered
-        per-chat with a debounce: each new file resets a short timer, and
-        the whole burst is processed together once uploads pause.
-- v3.1: per-file tracking (message_id -> path -> upload name -> status).
-        Upload continues past individual failures instead of aborting the
-        whole batch. Final report lists successes/failures by exact
-        filename. Successfully uploaded messages are deleted from the chat
-        (Telegram lets bots delete their own incoming private messages);
-        deletion failures are reported honestly, not hidden.
-- v3.0: storage backend Google Drive -> Yandex.Disk (accessible from BY/CIS).
-        Per-user Yandex OAuth tokens (access+refresh) in Supabase, auto-refresh.
-- v2.1: optional "обезличить имена" -> rename to 001, 002, 003…
-- v2.0: multi-user OAuth, optional cleaning, shareable link.
+PixKeep Bot: Telegram bot (admin-only) that takes photos and any files,
+optionally cleans metadata / fixes dark photos and uploads them to Google Drive
+(several Google accounts per user, one active at a time).
 
 Flow: files -> (settings applied silently: clean? anonymize names?) ->
 folder name -> upload to the active Google account's Drive (per-file,
 continue on error) -> report + public link -> delete succeeded messages.
 
-Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
+Runs an aiohttp server (OAuth callback + /health) alongside aiogram polling.
+Version history: CHANGELOG.md (older per-version technical notes live in git
+history of this header).
 """
-VERSION = "5.26"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.27"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -293,7 +25,6 @@ from collections import Counter
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
@@ -1335,28 +1066,24 @@ BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Bot API: bots can't download files
 
 
 def _media_info(message: Message) -> tuple[str, str, int | None] | None:
-    """(file_id, file_name, file_size) of whatever the message carries."""
-    u = uuid.uuid4().hex
-    if message.document:
-        d = message.document
-        return d.file_id, d.file_name or f"{u}.jpg", d.file_size
-    if message.photo:
-        p = message.photo[-1]
-        return p.file_id, f"{u}.jpg", p.file_size
-    if message.video:
-        v = message.video
-        return v.file_id, v.file_name or f"{u}.mp4", v.file_size
-    if message.audio:
-        a = message.audio
-        return a.file_id, a.file_name or f"{u}.mp3", a.file_size
-    if message.voice:
-        return message.voice.file_id, f"{u}.ogg", message.voice.file_size
-    if message.video_note:
-        return message.video_note.file_id, f"{u}.mp4", message.video_note.file_size
-    if message.animation:
-        an = message.animation
-        return an.file_id, an.file_name or f"{u}.mp4", an.file_size
-    return None
+    """(file_id, file_name, file_size) of whatever the message carries.
+    Nameless media are named after file_unique_id, so repeated calls for the
+    same message give the same name (it was a fresh uuid each time)."""
+    media = (message.document or (message.photo[-1] if message.photo else None)
+             or message.video or message.audio or message.voice
+             or message.video_note or message.animation)
+    if media is None:
+        return None
+    if message.document or message.photo:
+        default_ext = ".jpg"
+    elif message.audio:
+        default_ext = ".mp3"
+    elif message.voice:
+        default_ext = ".ogg"
+    else:
+        default_ext = ".mp4"
+    name = getattr(media, "file_name", None) or f"{media.file_unique_id}{default_ext}"
+    return media.file_id, name, media.file_size
 
 
 class DownloadSkipped(Exception):
@@ -1528,12 +1255,10 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
             try:
                 return await _download(msg, work_dir)
             except DownloadSkipped as e:
-                info = _media_info(msg)
                 skipped.append((info[1] if info else "?", str(e)))
                 return None
             except Exception as e:
                 logging.exception("download failed")
-                info = _media_info(msg)
                 skipped.append((info[1] if info else "?", f"ошибка: {str(e)[:60]}"))
                 return None
 
@@ -1631,7 +1356,7 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         note += "\n" + _skipped_text(skipped) + "\n(их сообщения остаются в чате)"
     unclean = [it["orig_name"] for it in items if it.get("clean_failed")]
     if unclean:
-        note += (f"\n⚠️ Метаданные не удалось почистить (загружу как есть): "
+        note += ("\n⚠️ Метаданные не удалось почистить (загружу как есть): "
                  + ", ".join(unclean[:5]) + (f" и ещё {len(unclean) - 5}" if len(unclean) > 5 else ""))
     if gps_count:
         note += f"\n⚠️ В {gps_count} из них есть GPS-координаты съёмки."

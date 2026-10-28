@@ -1,13 +1,5 @@
 """
-oauth.py
-v4.2 - per-user Google OAuth (authorization-code flow, plain REST via aiohttp)
-
-Changelog:
-- v4.2: pending_states entries expire after 10 minutes (and are purged on
-        every new auth link); refresh failure with invalid_grant raises
-        TokenRevokedError so the bot can ask the user to reconnect.
-- v4.1: added get_user_email() — needed to label multiple connected Google
-        accounts distinctly in /accounts.
+Per-user Google OAuth (authorization-code flow, plain REST via aiohttp).
 
 Each user authorizes their own Google Drive on Google's own consent page.
 The bot only receives an authorization code -> tokens; it never sees the

@@ -7,7 +7,7 @@ Telegram-бот для администратора (`ADMIN_ID`): принима
 входа у получателя) и честный отчёт: что загрузилось, что нет, что оказалось
 дубликатом.
 
-Текущая версия — v5.26 (`/version` покажет, какая реально запущена).
+Текущая версия — v5.27 (`/version` покажет, какая реально запущена).
 История изменений с первой версии — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
@@ -241,5 +241,4 @@ alter table uploads add column if not exists comment_file_id text;
 | `exif_utils.py` | инспекция и чистка метаданных через exiftool |
 | `oauth.py`, `config.py` | OAuth-поток Google, переменные окружения |
 | `migrations/` | SQL для Supabase (индексы) |
-| `tests/` | автотесты (`pip install -r requirements-dev.txt && pytest tests`), CI в `.github/workflows` |
 | `CHANGELOG.md` | история версий с первой |

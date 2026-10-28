@@ -1,26 +1,8 @@
 """
-drive_utils.py
-v4.1 - Google Drive v3 REST API helpers (async, aiohttp, no Google client libs)
+Google Drive v3 REST API helpers (async, aiohttp, no Google client libs).
 
 API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
-
-Changelog:
-- v4.6: new_session() — a ClientSession that retries 429/5xx and network
-        errors with exponential backoff (honours Retry-After); upload_file
-        rebuilds its multipart body for every attempt.
-- v4.5: list_folder_md5 also returns name -> md5s (duplicate skipping vs. replace_duplicates).
-- v4.4: get_quota, list_folder_md5, list_recent_folders, rename_file,
-        get_file_meta, download_file (quota display, duplicate skipping,
-        folder suggestions, rename, "send file to chat").
-- v4.3: optional content_type for upload_file / replace_file_content (txt files).
-- v4.2: upload_file now returns the new file's id; added trash_file,
-        folder_is_empty, revoke_public_access (for "Мои загрузки").
-- v4.1: added find_file_in_folder + replace_file_content, for the
-        replace_duplicates setting — lets main.py overwrite an existing
-        same-named file in place instead of always creating a new one via
-        upload_file (Drive's default: filenames aren't unique, so uploading
-        the same file twice used to just leave two copies behind).
 """
 import asyncio
 import json
@@ -49,7 +31,7 @@ def _delay(attempt: int, retry_after: str | None) -> float:
 
 
 # aiohttp warns that subclassing ClientSession is "discouraged"; the version is
-# pinned in requirements.txt and tests/test_drive_retry.py covers this class.
+# pinned in requirements.txt.
 class RetrySession(aiohttp.ClientSession):
     """ClientSession that transparently retries transient failures.
 
