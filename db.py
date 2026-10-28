@@ -29,6 +29,7 @@ Tables (create once, SQL in README):
             created_at timestamptz default now())
 
 Changelog:
+- v5.8: rename_folder_rows (rename a folder from «Мои загрузки»).
 - v5.7: folder comments — uploads.comment / uploads.comment_file_id,
         list_uploads_by_folder, set_folder_comment_file; save_upload returns
         the new row id; pruning never drops rows that carry a comment.
@@ -295,4 +296,9 @@ def list_uploads_by_folder(telegram_id: int, folder_id: str) -> list[dict]:
 
 def set_folder_comment_file(telegram_id: int, folder_id: str, file_id: str | None) -> None:
     _supabase.table("uploads").update({"comment_file_id": file_id}).eq(
+        "telegram_id", telegram_id).eq("folder_id", folder_id).execute()
+
+
+def rename_folder_rows(telegram_id: int, folder_id: str, new_name: str) -> None:
+    _supabase.table("uploads").update({"folder_name": new_name}).eq(
         "telegram_id", telegram_id).eq("folder_id", folder_id).execute()

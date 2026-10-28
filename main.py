@@ -1,8 +1,16 @@
 """
 main.py
-v5.21 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.23 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
-Changelog:
+Changelog (полный список по версиям — в CHANGELOG.md):
+- v5.23: (1) свободное место по аккаунтам в /accounts, предупреждение перед
+        загрузкой и строка «💾 занято» в отчёте (Drive about.get; при отказе
+        Google — «?»); (2) пропуск дубликатов по md5 (внутри пачки и в
+        папке); (3) подсказки папок кнопками под вопросом об имени;
+        (4) прогресс «N/M» и «🔁 Повторить неудачные» (файлы хранятся 30 мин);
+        (5) «Мои загрузки»: переименовать папку, прислать файл в чат (до 50 МБ);
+        при старте очищается TEMP_DIR.
+- v5.22: в /accounts под списком аккаунтов добавлена кнопка «➕ Добавить аккаунт».
 - v5.21: приём ЛЮБЫХ файлов — теперь принимаются и видео, аудио, голосовые,
         кружки и GIF (раньше только фото и документы; остальное молча
         игнорировалось). Исправлено: (1) один не скачавшийся файл (напр.
@@ -263,10 +271,12 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.21"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.23"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
+import hashlib
+import time
 import logging
 import os
 import shutil
@@ -287,6 +297,7 @@ from aiogram.types import (
     BotCommand,
     CallbackQuery,
     CopyTextButton,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -304,6 +315,7 @@ from db import (
     update_upload,
     delete_upload,
     delete_uploads_by_folder,
+    rename_folder_rows,
     list_uploads_by_folder,
     set_folder_comment_file,
     get_settings,
@@ -327,6 +339,12 @@ from drive_utils import (
     trash_file,
     folder_is_empty,
     revoke_public_access,
+    get_quota,
+    list_folder_md5,
+    list_recent_folders,
+    rename_file,
+    get_file_meta,
+    download_file,
 )
 from oauth import build_auth_url, exchange_code, refresh_access_token, get_user_email
 
@@ -443,17 +461,77 @@ async def _heartbeat(chat_id: int, action: str = ChatAction.UPLOAD_DOCUMENT):
 class Flow(StatesGroup):
     waiting_folder_name = State()
     waiting_comment = State()
+    waiting_rename = State()
 
 
 # ---------------------------------------------------------------- commands ---
-def _accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
+def _fmt_bytes(n: float) -> str:
+    units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024
+        i += 1
+    return f"{n:.0f} {units[i]}" if i < 2 else f"{n:.1f} {units[i]}".replace(".", ",")
+
+
+_quota_cache: dict[int, tuple[float, int, int | None]] = {}
+QUOTA_TTL = 60.0
+
+
+async def _account_quota(account: dict, fresh: bool = False) -> tuple[int, int | None] | None:
+    """(used, limit) of an account's Google storage, or None if it couldn't be
+    fetched (the feature is informational — never blocks anything)."""
+    now = time.monotonic()
+    hit = _quota_cache.get(account["id"])
+    if hit and not fresh and now - hit[0] < QUOTA_TTL:
+        return hit[1], hit[2]
+    try:
+        used, limit = await asyncio.wait_for(
+            _with_drive(account, lambda s, t: get_quota(s, t)), 8
+        )
+    except Exception as e:
+        logging.warning(f"quota fetch failed for account {account['id']}: {e}")
+        return None
+    _quota_cache[account["id"]] = (now, used, limit)
+    return used, limit
+
+
+def _quota_label(q: tuple[int, int | None] | None) -> str:
+    if not q:
+        return "?"
+    used, limit = q
+    return f"{_fmt_bytes(used)} из {_fmt_bytes(limit)}" if limit else f"{_fmt_bytes(used)} (без лимита)"
+
+
+def _accounts_keyboard(accounts: list[dict], telegram_id: int,
+                       quotas: dict[int, str] | None = None) -> InlineKeyboardMarkup:
     rows = []
     for a in accounts:
         mark = "✅ " if a["is_active"] else ""
+        q = f" · {quotas[a['id']]}" if quotas and a["id"] in quotas else ""
         rows.append([InlineKeyboardButton(
-            text=f"{mark}{a['email']}", callback_data=f"acct:{a['id']}"
+            text=f"{mark}{a['email']}{q}", callback_data=f"acct:{a['id']}"
         )])
+    rows.append([InlineKeyboardButton(
+        text="➕ Добавить аккаунт", url=build_auth_url(telegram_id)
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _accounts_view(uid: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    accounts = list_accounts(uid)
+    if not accounts:
+        return None
+    full = {a["id"]: get_account_by_id(uid, a["id"]) for a in accounts}
+    qs = await asyncio.gather(*[
+        _account_quota(full[a["id"]]) if full[a["id"]] else asyncio.sleep(0, result=None)
+        for a in accounts
+    ])
+    quotas = {a["id"]: _quota_label(q) for a, q in zip(accounts, qs)}
+    return (
+        "Твои Google-аккаунты (занято места) — нажми, чтобы сделать активным для загрузки:",
+        _accounts_keyboard(accounts, uid, quotas),
+    )
 
 
 @dp.message(CommandStart())
@@ -504,22 +582,21 @@ async def start(message: Message):
 
 @dp.message(Command("accounts"))
 async def accounts_cmd(message: Message):
-    accounts = list_accounts(message.from_user.id)
-    if not accounts:
+    view = await _accounts_view(message.from_user.id)
+    if not view:
         await message.answer("Нет подключённых аккаунтов. /start чтобы подключить.")
         return
-    await message.answer(
-        "Твои Google-аккаунты — нажми, чтобы сделать активным для загрузки:",
-        reply_markup=_accounts_keyboard(accounts),
-    )
+    text, kb = view
+    await message.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("acct:"))
 async def on_switch_account(cq: CallbackQuery):
     account_id = int(cq.data.split(":", 1)[1])
     set_active_account(cq.from_user.id, account_id)
-    accounts = list_accounts(cq.from_user.id)
-    await cq.message.edit_reply_markup(reply_markup=_accounts_keyboard(accounts))
+    view = await _accounts_view(cq.from_user.id)
+    if view:
+        await cq.message.edit_reply_markup(reply_markup=view[1])
     await cq.answer("Активный аккаунт изменён")
 
 
@@ -594,6 +671,8 @@ def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
     kb.append([InlineKeyboardButton(text="💬 Добавить комментарий", callback_data=f"cmt:{uid}")])
     if comment:
         kb.append([InlineKeyboardButton(text="🧹 Удалить комментарий", callback_data=f"cmtdel:{uid}")])
+    kb.append([InlineKeyboardButton(text="📥 Прислать файл в чат", callback_data=f"upg:{uid}:0")])
+    kb.append([InlineKeyboardButton(text="✏️ Переименовать папку", callback_data=f"upren:{uid}")])
     kb.append([InlineKeyboardButton(text="🗑 Удалить отдельные файлы", callback_data=f"upf:{uid}:0")])
     kb.append([InlineKeyboardButton(text="🗑 Удалить всю загрузку", callback_data=f"updel:{uid}")])
     kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="uplist")])
@@ -833,25 +912,30 @@ async def on_comment_delete(cq: CallbackQuery):
 FILES_PER_PAGE = 8
 
 
-def _upload_files_view(u: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+def _upload_files_view(u: dict, page: int, mode: str = "del") -> tuple[str, InlineKeyboardMarkup]:
+    """mode "del": tap a file to trash it; mode "get": tap a file to have it
+    sent to the chat."""
     files = _real(u["files"])
     pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
     page = min(max(page, 0), pages - 1)
     chunk = files[page * FILES_PER_PAGE:(page + 1) * FILES_PER_PAGE]
     uid = u["id"]
+    icon, act, nav_cb = ("🗑", "upfd", "upf") if mode == "del" else ("📥", "upgd", "upg")
     kb = [[InlineKeyboardButton(
-        text=f"🗑 {f['name']}"[:60], callback_data=f"upfd:{uid}:{f['id']}"
+        text=f"{icon} {f['name']}"[:60], callback_data=f"{act}:{uid}:{f['id']}"
     )] for f in chunk]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"upf:{uid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"{nav_cb}:{uid}:{page - 1}"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"upf:{uid}:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"{nav_cb}:{uid}:{page + 1}"))
     if nav:
         kb.append(nav)
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"up:{uid}")])
-    text = (f"Нажми на файл, чтобы удалить его (уйдёт в корзину Google Диска).\n"
-            f"Папка «{u['folder_name']}», файлов: {len(files)}"
+    head = ("Нажми на файл, чтобы удалить его (уйдёт в корзину Google Диска)."
+            if mode == "del" else
+            "Нажми на файл, чтобы я прислал его сюда (до 50 МБ — лимит Telegram для ботов).")
+    text = (f"{head}\nПапка «{u['folder_name']}», файлов: {len(files)}"
             + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""))
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -919,6 +1003,121 @@ async def on_upload_file_delete(cq: CallbackQuery):
     text, kb = _upload_files_view(u, 0)
     await cq.message.edit_text(text, reply_markup=kb)
     await cq.answer(f"Удалён: {target['name']}")
+
+
+TG_SEND_LIMIT = 50 * 1024 * 1024   # Bot API: bots can send files up to 50 MB
+
+
+@dp.callback_query(F.data.regexp(r"^upg:\d+:\d+$"))
+async def on_upload_get_list(cq: CallbackQuery):
+    _, raw_id, raw_page = cq.data.split(":")
+    u = get_upload(cq.from_user.id, int(raw_id))
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    text, kb = _upload_files_view(u, int(raw_page), mode="get")
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^upgd:\d+:[\w-]+$"))
+async def on_upload_get_file(cq: CallbackQuery):
+    _, raw_id, file_id = cq.data.split(":")
+    u = get_upload(cq.from_user.id, int(raw_id))
+    target = next((f for f in _real(u["files"]) if f["id"] == file_id), None) if u else None
+    if not target:
+        await cq.answer("Файл не найден в этой загрузке", show_alert=True)
+        return
+    account = await _account_for(cq, u)
+    if not account:
+        return
+    await cq.answer("Скачиваю с Диска…")
+    path = None
+    try:
+        meta = await _with_drive(account, lambda s, t: get_file_meta(s, t, file_id))
+        if meta["size"] and meta["size"] > TG_SEND_LIMIT:
+            await cq.message.answer(
+                f"«{meta['name']}» весит {_fmt_bytes(meta['size'])} — больше 50 МБ, "
+                "прислать в чат не получится. Открой его по ссылке на папку.")
+            return
+        os.makedirs(config.TEMP_DIR, exist_ok=True)
+        path = os.path.join(config.TEMP_DIR, f"send_{uuid.uuid4().hex}")
+        await _with_drive(account, lambda s, t: download_file(s, t, file_id, path))
+        await bot.send_document(
+            cq.message.chat.id,
+            FSInputFile(path, filename=meta["name"] or target["name"]),
+            caption=f"📁 {u['folder_name']}",
+        )
+    except Exception as e:
+        logging.exception("send file to chat failed")
+        await cq.message.answer(f"Не удалось прислать файл: {e}")
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+@dp.callback_query(F.data.regexp(r"^upren:\d+$"))
+async def on_rename_start(cq: CallbackQuery, state: FSMContext):
+    uid = int(cq.data.split(":")[1])
+    u = get_upload(cq.from_user.id, uid)
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    cur = await state.get_state()
+    if cur != Flow.waiting_rename.state:
+        await state.update_data(rename_prev_state=cur)
+    await state.update_data(rename_upload_id=uid)
+    await state.set_state(Flow.waiting_rename)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="renx")],
+    ])
+    await cq.message.answer(
+        f"✏️ Введите новое имя для папки «{u['folder_name']}» одним сообщением.",
+        reply_markup=kb,
+    )
+    await cq.answer()
+
+
+async def _restore_rename_state(state: FSMContext, prev: str | None) -> None:
+    await state.set_state(prev)
+    await state.update_data(rename_upload_id=None, rename_prev_state=None)
+
+
+@dp.callback_query(F.data == "renx")
+async def on_rename_cancel(cq: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if await state.get_state() == Flow.waiting_rename.state:
+        await _restore_rename_state(state, data.get("rename_prev_state"))
+    await cq.message.edit_text("❌ Переименование отменено.")
+    await cq.answer()
+
+
+@dp.message(Flow.waiting_rename, F.text, ~F.text.startswith("/"))
+async def on_rename_text(message: Message, state: FSMContext):
+    tg = message.from_user.id
+    data = await state.get_data()
+    prev = data.get("rename_prev_state")
+    uid = data.get("rename_upload_id")
+    new_name = message.text.strip()
+    u = get_upload(tg, uid) if uid else None
+    account = get_account_by_id(tg, u["account_id"]) if u else None
+    if not u or not account:
+        await _restore_rename_state(state, prev)
+        await message.answer("Не нашёл эту загрузку или её аккаунт — не переименовал.")
+        return
+    if not new_name or len(new_name) > 100:
+        await message.answer("Имя должно быть от 1 до 100 символов. Введи ещё раз или нажми «Отмена».")
+        return
+    try:
+        await _with_drive(account, lambda s, t: rename_file(s, t, u["folder_id"], new_name))
+        rename_folder_rows(tg, u["folder_id"], new_name)
+    except Exception as e:
+        logging.exception("rename failed")
+        await _restore_rename_state(state, prev)
+        await message.answer(f"Не удалось переименовать: {e}")
+        return
+    await _restore_rename_state(state, prev)
+    await message.answer(f"✏️ Папка «{u['folder_name']}» теперь называется «{new_name}».")
 
 
 @dp.callback_query(F.data.regexp(r"^updel:\d+$"))
@@ -1447,19 +1646,49 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
 folder_name_queue: dict[int, list[dict]] = {}
 
 
+_folders_cache: dict[int, tuple[float, list[str]]] = {}
+
+
+async def _recent_folders(account: dict) -> list[str]:
+    hit = _folders_cache.get(account["id"])
+    if hit and time.monotonic() - hit[0] < 30:
+        return hit[1]
+    try:
+        names = await asyncio.wait_for(
+            _with_drive(account, lambda s, t: list_recent_folders(s, t, 6)), 6)
+    except Exception as e:
+        logging.warning(f"recent folders fetch failed: {e}")
+        return []
+    _folders_cache[account["id"]] = (time.monotonic(), names)
+    return names
+
+
 async def _ask_folder_name(chat_id: int, state: FSMContext, items: list[dict],
                             work_dir: str, note: str) -> None:
     """Puts one batch into Flow.waiting_folder_name and sends its prompt.
     Shared by _process (first batch for a chat) and _ask_next_queued (any
     batch that had to wait behind it)."""
-    await state.update_data(items=items, work_dir=work_dir)
+    # v5.23: quick-pick buttons: today's date + the folders this bot created
+    # most recently on the active account (private chat: chat_id == user id).
+    names = [datetime.now(LOCAL_TZ).strftime("%d.%m.%y")]
+    try:
+        account = get_active_account(chat_id)
+        if account:
+            recent = await _recent_folders(account)
+            names += [n for n in recent if n not in names]
+    except Exception:
+        logging.exception("folder suggestions failed")
+    names = names[:6]
+
+    await state.update_data(items=items, work_dir=work_dir, folder_suggestions=names)
     await state.set_state(Flow.waiting_folder_name)
 
-    note += "\n\nУкажите имя папки на Google Drive. Если такой папки нет, она будет создана."
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")],
-    ])
-    await bot.send_message(chat_id, note, reply_markup=cancel_kb)
+    note += ("\n\nУкажите имя папки на Google Drive (текстом) или выберите ниже. "
+             "Если такой папки нет, она будет создана.")
+    kb_rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"fld:{i}")]
+               for i, n in enumerate(names)]
+    kb_rows.append([InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")])
+    await bot.send_message(chat_id, note, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 async def _ask_next_queued(chat_id: int, state: FSMContext) -> None:
@@ -1498,8 +1727,17 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
 UPLOAD_CONCURRENCY = 4
 
 
+def _md5_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 async def _upload_all(account: dict, items: list[dict], folder_name: str,
-                      replace_duplicates: bool = False) -> tuple[list[dict], str, str]:
+                      replace_duplicates: bool = False,
+                      on_progress=None) -> tuple[list[dict], str, str]:
     """Upload every item to the user's Google Drive folder, concurrently
     (bounded by UPLOAD_CONCURRENCY). Continues past individual file
     failures (records them, doesn't abort).
@@ -1545,6 +1783,40 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
             access_token = await refresh_once()
             folder_id = await ensure_folder(session, access_token, folder_name)
 
+        # v5.23: skip files whose content is already in the folder (or repeated
+        # inside this batch) — compared by md5 against Drive's md5Checksum.
+        try:
+            try:
+                known = await list_folder_md5(session, access_token, folder_id)
+            except GoogleAuthError:
+                access_token = await refresh_once()
+                known = await list_folder_md5(session, access_token, folder_id)
+        except Exception as e:
+            logging.warning(f"duplicate check against folder skipped: {e}")
+            known = {}
+        hashes = await asyncio.gather(*[asyncio.to_thread(_md5_file, it["upload_path"]) for it in items])
+        seen = dict(known)
+        to_upload: list[int] = []
+        for i, (it, h) in enumerate(zip(items, hashes)):
+            if h in seen:
+                results[i] = {**it, "success": True, "error": None,
+                              "file_id": None, "duplicate_of": seen[h]}
+            else:
+                seen[h] = it["upload_name"]
+                to_upload.append(i)
+
+        done = len(items) - len(to_upload)
+        total = len(items)
+
+        async def _tick() -> None:
+            nonlocal done
+            done += 1
+            if on_progress:
+                try:
+                    await on_progress(done, total)
+                except Exception:
+                    pass
+
         async def _put_one(token: str, it: dict) -> str:
             """Does the actual create-or-replace for one item, given a
             known-good token. Raises on failure so both call sites below
@@ -1582,7 +1854,11 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
                     logging.error(f"upload failed for {it['upload_name']} after refresh: {e}")
                     results[index] = {**it, "success": False, "error": str(e)}
 
-        await asyncio.gather(*[_upload_one(i, it) for i, it in enumerate(items)])
+        async def _upload_tracked(i: int) -> None:
+            await _upload_one(i, items[i])
+            await _tick()
+
+        await asyncio.gather(*[_upload_tracked(i) for i in to_upload])
 
         url = await publish_and_get_url(session, access_token, folder_id)
     return results, url, folder_id
@@ -1590,7 +1866,8 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
 
 def _build_list_text(folder_name: str, results: list[dict], s: dict) -> str:
     now = datetime.now(LOCAL_TZ)
-    ok = [r for r in results if r["success"]]
+    dup = [r for r in results if r.get("duplicate_of")]
+    ok = [r for r in results if r["success"] and not r.get("duplicate_of")]
     bad = [r for r in results if not r["success"]]
     lines = [
         "PixKeep upload list",
@@ -1598,11 +1875,13 @@ def _build_list_text(folder_name: str, results: list[dict], s: dict) -> str:
         f"Folder: {folder_name.strip()}",
         f"Metadata: {'cleaned' if s['clean_metadata'] else 'kept'}",
         f"Photo correction: {s['photo_fix']}",
-        f"Files: {len(ok)} uploaded, {len(bad)} failed",
+        f"Files: {len(ok)} uploaded, {len(dup)} skipped as duplicates, {len(bad)} failed",
         "",
     ]
     for r in results:
-        if r["success"]:
+        if r.get("duplicate_of"):
+            line = f"{r['upload_name']} - duplicate, skipped (same as {r['duplicate_of']})"
+        elif r["success"]:
             line = f"{r['upload_name']} - {'edited' if r.get('edited') else 'original'}"
             if r.get("rotated"):
                 line += ", rotated upright"
@@ -1638,36 +1917,88 @@ async def _upload_list_file(account: dict, folder_id: str, folder_name: str,
     return {"id": file_id, "name": name, "report": True}
 
 
+# v5.23: failed files keep their temp dir for RETRY_TTL seconds so the
+# "🔁 Повторить неудачные" button can re-send them without asking again.
+RETRY_TTL = 30 * 60
+_retry_store: dict[str, dict] = {}
+
+
+async def _expire_retry(token: str) -> None:
+    try:
+        await asyncio.sleep(RETRY_TTL)
+    except asyncio.CancelledError:
+        return
+    entry = _retry_store.pop(token, None)
+    if entry and entry["work_dir"] and os.path.exists(entry["work_dir"]):
+        shutil.rmtree(entry["work_dir"], ignore_errors=True)
+
+
 async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
                      work_dir: str | None, folder_name: str) -> None:
     """Shared by both the manual folder-name prompt and the auto-date-folder
-    path: upload, report per-file success/failure, delete succeeded chat
-    messages, clean up temp files."""
+    path: upload (with live progress), report per-file success/failure,
+    delete source messages of what got to Drive, keep failed files for retry,
+    clean up temp files."""
+    def _cleanup() -> None:
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
+
     account = get_active_account(telegram_id)
     if not account:
         await bot.send_message(chat_id, "Диск не подключён. /start чтобы подключить.")
-        if work_dir and os.path.exists(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        _cleanup()
         return
 
-    await bot.send_message(chat_id, f"Загружаю в папку «{folder_name}»...")
+    # Free-space heads-up (informational: the upload still goes ahead).
+    try:
+        total_size = sum(os.path.getsize(it["upload_path"]) for it in items
+                         if os.path.exists(it["upload_path"]))
+        q = await _account_quota(account)
+        if q and q[1] and q[0] + total_size > q[1]:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ На аккаунте {account['email']} свободно {_fmt_bytes(max(q[1] - q[0], 0))}, "
+                f"а пачка весит {_fmt_bytes(total_size)}. Часть файлов может не загрузиться — "
+                "можно переключить аккаунт в /accounts и нажать «Повторить неудачные».",
+            )
+    except Exception:
+        logging.exception("quota pre-check failed")
+
+    status = await bot.send_message(chat_id, f"Загружаю в папку «{folder_name}»… 0/{len(items)}")
+    last_edit = [0.0]
+
+    async def on_progress(done: int, total: int) -> None:
+        now = time.monotonic()
+        if done < total and now - last_edit[0] < 2.0:
+            return
+        last_edit[0] = now
+        with contextlib.suppress(Exception):
+            await status.edit_text(f"Загружаю в папку «{folder_name}»… {done}/{total}")
+
+    async def _drop_status() -> None:
+        with contextlib.suppress(Exception):
+            await status.delete()
 
     user_settings = get_settings(telegram_id)
     replace_duplicates = user_settings["replace_duplicates"]
     try:
         async with _heartbeat(chat_id):
-            results, link, folder_id = await _upload_all(account, items, folder_name, replace_duplicates)
+            results, link, folder_id = await _upload_all(
+                account, items, folder_name, replace_duplicates, on_progress)
     except Exception as e:
         logging.exception("upload failed")
+        await _drop_status()
         await bot.send_message(chat_id, f"Ошибка при загрузке: {e}")
-        if work_dir and os.path.exists(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        _cleanup()
         return
+    await _drop_status()
 
-    succeeded = [r for r in results if r["success"]]
+    succeeded = [r for r in results if r["success"]]            # on Drive (new or already there)
+    uploaded = [r for r in succeeded if not r.get("duplicate_of")]
+    dups = [r for r in succeeded if r.get("duplicate_of")]
     failed = [r for r in results if not r["success"]]
 
-    # v5.17: optional txt list of the batch, uploaded next to the files.
+    # Optional txt list of the batch, uploaded next to the files.
     report_entry = None
     list_failed = False
     if user_settings["upload_list"] and succeeded:
@@ -1681,9 +2012,13 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
             list_failed = True
 
     lines = []
-    if succeeded:
-        names = ", ".join(r["upload_name"] for r in succeeded)
-        lines.append(f"✅ Загружено ({len(succeeded)}): {names}")
+    if uploaded:
+        names = ", ".join(r["upload_name"] for r in uploaded)
+        lines.append(f"✅ Загружено ({len(uploaded)}): {names}")
+    if dups:
+        shown = ", ".join(f"{r['upload_name']} (= {r['duplicate_of']})" for r in dups[:5])
+        more = f" и ещё {len(dups) - 5}" if len(dups) > 5 else ""
+        lines.append(f"♻️ Уже есть в папке, пропущено ({len(dups)}): {shown}{more}")
     if failed:
         names = ", ".join(r["orig_name"] for r in failed)
         lines.append(f"❌ Не удалось загрузить ({len(failed)}): {names}")
@@ -1693,43 +2028,46 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
         lines.append("⚠️ txt-список загрузить не удалось (файлы при этом загружены).")
     if succeeded:
         lines.append(f"\nПапка (доступ на чтение всем, у кого есть ссылка):\n{link}")
+        q2 = await _account_quota(account, fresh=True)
+        if q2:
+            lines.append(f"💾 {account['email']}: занято {_quota_label(q2)}")
 
-    # v5.8: the link in the text above is already tappable (opens the
-    # folder), but Telegram's default tap gesture for a plain URL is
-    # "open", not "copy" — there's no way to long-press-copy it without
-    # first opening the browser. copy_text is a separate inline-button type
-    # (Bot API 7.x+) whose only job is "put this exact string on the
-    # clipboard when tapped", so we add it alongside the text link rather
-    # than instead of it — one tap to open, or one tap on the button to copy.
     upload_row_id = None
-    if succeeded:
+    if uploaded:
         try:
             upload_row_id = save_upload(
                 telegram_id, account["id"], folder_id, folder_name.strip(), link,
-                [{"id": r["file_id"], "name": r["upload_name"]} for r in succeeded]
+                [{"id": r["file_id"], "name": r["upload_name"]} for r in uploaded]
                 + ([report_entry] if report_entry else []),
             )
         except Exception:
             logging.exception("couldn't record upload in history")
 
-    reply_markup = None
+    rows = []
     if succeeded:
-        rows = [[InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))]]
+        # v5.8: copy_text puts the link on the clipboard in one tap (the text
+        # link above only opens the folder).
+        rows.append([InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))])
         if upload_row_id:
             rows.append([InlineKeyboardButton(text="💬 Добавить комментарий",
                                               callback_data=f"cmt:{upload_row_id}")])
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=rows)
-    await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
+    keep_dir = False
+    if failed:
+        token = uuid.uuid4().hex[:10]
+        failed_items = [items[i] for i, r in enumerate(results) if not r["success"]]
+        _retry_store[token] = {
+            "items": failed_items, "work_dir": work_dir, "folder_name": folder_name,
+            "telegram_id": telegram_id,
+            "task": asyncio.create_task(_expire_retry(token)),
+        }
+        keep_dir = True
+        rows.append([InlineKeyboardButton(
+            text=f"🔁 Повторить неудачные ({len(failed)})", callback_data=f"retry:{token}")])
+    await bot.send_message(chat_id, "\n".join(lines),
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
-    # Delete original chat messages only for files that actually uploaded.
-    # v5.13: v5.12 wrapped this in the TYPING chat-action to give some sign
-    # it was happening. But there's no "done" chat-action to follow it with
-    # (Bot API's action vocabulary is a fixed set of in-progress states,
-    # nothing means "finished") — so all that flash of "печатает..." right
-    # at the end actually accomplished was raising "why did it say typing
-    # and then nothing?". Deletion is quick regardless; doing it plainly
-    # here means the upload report above is simply the last thing in the
-    # chat, full stop, with nothing flickering after it.
+    # Delete source messages only for files that are on Drive (v5.13: plainly,
+    # with no chat-action flicker, so the report stays the last thing in chat).
     not_deleted = 0
     for r in succeeded:
         try:
@@ -1738,10 +2076,6 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
             logging.warning(f"couldn't delete message {r['message_id']}: {e}")
             not_deleted += 1
 
-    # Only speak up here if something actually needs attention (a handful
-    # of messages Telegram wouldn't let us delete, e.g. too old) — that's
-    # real information the person has to act on, not a routine confirmation.
-    # When everything deleted cleanly, the report above stays the last word.
     if not_deleted:
         await bot.send_message(
             chat_id,
@@ -1749,20 +2083,35 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
             "обычно если прошло слишком много времени, удали вручную при желании.",
         )
 
-    if work_dir and os.path.exists(work_dir):
-        shutil.rmtree(work_dir, ignore_errors=True)
+    if not keep_dir:
+        _cleanup()
 
 
-@dp.message(Flow.waiting_folder_name, F.text)
-async def on_folder_name(message: Message, state: FSMContext):
-    chat_id = message.chat.id
-    data = await state.get_data()
+@dp.callback_query(F.data.regexp(r"^retry:\w+$"))
+async def on_retry(cq: CallbackQuery):
+    token = cq.data.split(":", 1)[1]
+    entry = _retry_store.get(token)
+    if not entry or entry["telegram_id"] != cq.from_user.id or not os.path.exists(entry["work_dir"] or ""):
+        _retry_store.pop(token, None)
+        await cq.answer("Время вышло или бот перезапускался — отправь эти файлы заново.", show_alert=True)
+        return
+    _retry_store.pop(token)
+    entry["task"].cancel()
+    await cq.answer("Повторяю…")
+    with contextlib.suppress(Exception):
+        await cq.message.edit_reply_markup(reply_markup=None)
+    chat_id = cq.message.chat.id
+    async with _get_chat_lock(chat_id):
+        await _do_upload(chat_id, cq.from_user.id, entry["items"],
+                         entry["work_dir"], entry["folder_name"])
+
+
+async def _begin_upload(chat_id: int, telegram_id: int, state: FSMContext,
+                        data: dict, folder_name: str) -> None:
     items = data.get("items", [])
     work_dir = data.get("work_dir")
-    folder_name = message.text.strip()
-
     if not items:
-        await message.answer("Нет файлов для загрузки, начни заново.")
+        await bot.send_message(chat_id, "Нет файлов для загрузки, начни заново.")
         await state.clear()
         return
 
@@ -1772,8 +2121,31 @@ async def on_folder_name(message: Message, state: FSMContext):
     # its own prompt asked out of turn, and so this upload's ensure_folder()
     # call can't race a concurrently-arriving new batch's.
     async with _get_chat_lock(chat_id):
-        await _do_upload(chat_id, message.from_user.id, items, work_dir, folder_name)
+        await _do_upload(chat_id, telegram_id, items, work_dir, folder_name)
         await _ask_next_queued(chat_id, state)
+
+
+@dp.message(Flow.waiting_folder_name, F.text)
+async def on_folder_name(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await _begin_upload(message.chat.id, message.from_user.id, state, data, message.text.strip())
+
+
+@dp.callback_query(F.data.regexp(r"^fld:\d+$"))
+async def on_folder_pick(cq: CallbackQuery, state: FSMContext):
+    if await state.get_state() != Flow.waiting_folder_name.state:
+        await cq.answer("Сначала заверши ввод комментария/названия или отмени его.", show_alert=True)
+        return
+    data = await state.get_data()
+    names = data.get("folder_suggestions") or []
+    idx = int(cq.data.split(":")[1])
+    if idx >= len(names):
+        await cq.answer("Кнопка устарела — введи имя папки текстом.", show_alert=True)
+        return
+    await cq.answer()
+    with contextlib.suppress(Exception):
+        await cq.message.edit_reply_markup(reply_markup=None)
+    await _begin_upload(cq.message.chat.id, cq.from_user.id, state, data, names[idx])
 
 
 # ------------------------------------------------------- oauth web server ----
@@ -1827,6 +2199,7 @@ BOT_COMMANDS = [
 
 
 async def main():
+    shutil.rmtree(config.TEMP_DIR, ignore_errors=True)   # leftovers of a previous run
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     await bot.set_my_commands(BOT_COMMANDS)
     await run_web()

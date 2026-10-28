@@ -9,6 +9,9 @@ API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
 
 Changelog:
+- v4.4: get_quota, list_folder_md5, list_recent_folders, rename_file,
+        get_file_meta, download_file (quota display, duplicate skipping,
+        folder suggestions, rename, "send file to chat").
 - v4.3: optional content_type for upload_file / replace_file_content (txt files).
 - v4.2: upload_file now returns the new file's id; added trash_file,
         folder_is_empty, revoke_public_access (for "Мои загрузки").
@@ -193,3 +196,88 @@ async def revoke_public_access(session: aiohttp.ClientSession, token: str,
             ) as resp:
                 if resp.status != 404:
                     await _check(resp, ok=(200, 204))
+
+
+async def get_quota(session: aiohttp.ClientSession, token: str) -> tuple[int, int | None]:
+    """(used_bytes, limit_bytes). limit is None for unlimited accounts."""
+    async with session.get(
+        f"{API}/about", params={"fields": "storageQuota(limit,usage)"},
+        headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        q = (await resp.json()).get("storageQuota", {})
+    limit = q.get("limit")
+    return int(q.get("usage", 0)), (int(limit) if limit else None)
+
+
+async def list_folder_md5(session: aiohttp.ClientSession, token: str,
+                          folder_id: str) -> dict[str, str]:
+    """md5 -> file name for every non-trashed file directly inside folder_id
+    (only files this app can see, i.e. the ones it created)."""
+    out: dict[str, str] = {}
+    page = None
+    while True:
+        params = {
+            "q": f"'{folder_id}' in parents and trashed=false",
+            "fields": "nextPageToken,files(name,md5Checksum)",
+            "pageSize": 1000,
+        }
+        if page:
+            params["pageToken"] = page
+        async with session.get(f"{API}/files", params=params, headers=_headers(token)) as resp:
+            await _check(resp, ok=(200,))
+            data = await resp.json()
+        for f in data.get("files", []):
+            if f.get("md5Checksum"):
+                out.setdefault(f["md5Checksum"], f["name"])
+        page = data.get("nextPageToken")
+        if not page:
+            return out
+
+
+async def list_recent_folders(session: aiohttp.ClientSession, token: str,
+                              limit: int = 6) -> list[str]:
+    """Names of the folders this app created, most recently modified first."""
+    async with session.get(
+        f"{API}/files",
+        params={
+            "q": "mimeType='application/vnd.google-apps.folder' and trashed=false",
+            "orderBy": "modifiedTime desc", "pageSize": limit,
+            "fields": "files(name)",
+        },
+        headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        data = await resp.json()
+    return [f["name"] for f in data.get("files", [])]
+
+
+async def rename_file(session: aiohttp.ClientSession, token: str,
+                      file_id: str, new_name: str) -> None:
+    async with session.patch(
+        f"{API}/files/{file_id}", json={"name": new_name}, headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+
+
+async def get_file_meta(session: aiohttp.ClientSession, token: str,
+                        file_id: str) -> dict:
+    """{"name": str, "size": int|None}"""
+    async with session.get(
+        f"{API}/files/{file_id}", params={"fields": "name,size"},
+        headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        data = await resp.json()
+    return {"name": data.get("name"), "size": int(data["size"]) if data.get("size") else None}
+
+
+async def download_file(session: aiohttp.ClientSession, token: str,
+                        file_id: str, dest_path: str) -> None:
+    async with session.get(
+        f"{API}/files/{file_id}", params={"alt": "media"}, headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        with open(dest_path, "wb") as f:
+            async for chunk in resp.content.iter_chunked(1 << 20):
+                f.write(chunk)
