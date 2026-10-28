@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 
-from config import config
+from pixkeep.config import config
 
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"

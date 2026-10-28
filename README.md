@@ -7,7 +7,7 @@ Telegram-бот для администратора (`ADMIN_ID`): принима
 входа у получателя) и честный отчёт: что загрузилось, что нет, что оказалось
 дубликатом.
 
-Текущая версия — v5.27 (`/version` покажет, какая реально запущена).
+Текущая версия — v5.28 (`/version` покажет, какая реально запущена).
 История изменений с первой версии — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
@@ -182,6 +182,12 @@ alter table uploads add column if not exists comment_file_id text;
 - `OAUTH_REDIRECT_URI` = `https://<твой-домен>.onrender.com/oauth/callback`
   (ровно как в Google Cloud Console)
 - `SUPABASE_URL`, `SUPABASE_KEY`
+- `TOKEN_KEY` (желательно) — любая длинная случайная строка, например из
+  менеджера паролей (40+ символов). С ней токены Google хранятся в Supabase
+  зашифрованными; уже сохранённые бот зашифрует сам при старте. **Не меняй и
+  не теряй её:** без прежнего ключа токены не расшифровать — придётся
+  `/logout` и подключить аккаунты заново. Без `TOKEN_KEY` токены хранятся
+  открытым текстом, как раньше.
 
 `PORT` Render задаёт сам; на нём работают OAuth-callback и `/health`.
 
@@ -234,11 +240,16 @@ alter table uploads add column if not exists comment_file_id text;
 ## Файлы проекта
 | Файл | Назначение |
 |---|---|
-| `main.py` | бот: хендлеры, пайплайн загрузки, веб-сервер OAuth/health |
-| `db.py` | Supabase: настройки, аккаунты, история загрузок, keep-alive |
-| `drive_utils.py` | Google Drive REST: папки, загрузка, квота, md5, переименование |
-| `photo_fix.py` | поворот по EXIF и автокоррекция теней (Pillow) |
-| `exif_utils.py` | инспекция и чистка метаданных через exiftool |
-| `oauth.py`, `config.py` | OAuth-поток Google, переменные окружения |
+| `main.py` | точка входа: диспетчер, доступ только для админа, запуск |
+| `pixkeep/handlers/` | обработчики Telegram: `start` (/start, /accounts, /help…), `settings`, `history` («Мои загрузки»), `intake` (приём файлов, имя папки) |
+| `pixkeep/pipeline.py` | подготовка пачки: скачивание, поворот, коррекция, чистка, имена |
+| `pixkeep/delivery.py` | загрузка на Drive, отчёт, повтор неудачных |
+| `pixkeep/texts.py` | тексты сообщений (HTML) |
+| `pixkeep/media.py` | «квитанции» файлов (`MediaRef`), даты для папки |
+| `pixkeep/drive.py`, `drive_utils.py` | `DriveClient` с обновлением токена; Google Drive REST |
+| `pixkeep/db.py`, `crypto.py` | Supabase (неблокирующие вызовы), шифрование токенов |
+| `pixkeep/photo_fix.py`, `exif_utils.py` | поворот и коррекция (Pillow), метаданные (exiftool) |
+| `pixkeep/oauth.py`, `config.py`, `web.py` | OAuth Google, переменные окружения, веб-сервер OAuth/health |
 | `migrations/` | SQL для Supabase (индексы) |
+| `tests/` | автотесты без сети: `pip install -r requirements-dev.txt && pytest`; CI — `.github/workflows/ci.yml` |
 | `CHANGELOG.md` | история версий с первой |

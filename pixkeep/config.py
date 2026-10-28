@@ -31,6 +31,10 @@ class Config:
     SUPABASE_URL = os.environ["SUPABASE_URL"]
     SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
+    # Optional: any long random string. When set, Google tokens are stored
+    # encrypted in Supabase (see crypto.py).
+    TOKEN_KEY = os.environ.get("TOKEN_KEY") or None
+
     PORT = int(os.environ.get("PORT", "10000"))
 
     # drive.file: app can only see/edit files IT created or that the user
