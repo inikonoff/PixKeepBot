@@ -29,6 +29,12 @@ Tables (create once, SQL in README):
             created_at timestamptz default now())
 
 Changelog:
+- v5.7: folder comments — uploads.comment / uploads.comment_file_id,
+        list_uploads_by_folder, set_folder_comment_file; save_upload returns
+        the new row id; pruning never drops rows that carry a comment.
+        REQUIRED migration before deploying v5.20:
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comment text;
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comment_file_id text;
 - v5.6: settings photo_fix (text: off/auto/always) and upload_list (boolean).
         REQUIRED migration before deploying v5.17:
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS photo_fix text default 'off';
@@ -191,9 +197,10 @@ UPLOADS_KEEP = 20  # rows kept per user; older ones are pruned on insert
 
 
 def save_upload(telegram_id: int, account_id: int, folder_id: str,
-                folder_name: str, link: str, files: list[dict]) -> None:
-    """files: [{"id": drive_file_id, "name": uploaded_name}, ...]"""
-    _supabase.table("uploads").insert({
+                folder_name: str, link: str, files: list[dict]) -> int | None:
+    """files: [{"id": drive_file_id, "name": uploaded_name}, ...]
+    Returns the new row's id."""
+    resp = _supabase.table("uploads").insert({
         "telegram_id": telegram_id,
         "account_id": account_id,
         "folder_id": folder_id,
@@ -201,9 +208,11 @@ def save_upload(telegram_id: int, account_id: int, folder_id: str,
         "link": link,
         "files": files,
     }).execute()
+    new_id = resp.data[0]["id"] if resp.data else None
     old = (
         _supabase.table("uploads").select("id")
         .eq("telegram_id", telegram_id)
+        .is_("comment", "null")
         .order("created_at", desc=True)
         .range(UPLOADS_KEEP, UPLOADS_KEEP + 200)
         .execute()
@@ -211,6 +220,7 @@ def save_upload(telegram_id: int, account_id: int, folder_id: str,
     ids = [r["id"] for r in (old.data or [])]
     if ids:
         _supabase.table("uploads").delete().in_("id", ids).execute()
+    return new_id
 
 
 def list_uploads(telegram_id: int, limit: int = 10) -> list[dict]:
@@ -270,3 +280,19 @@ async def keep_alive_loop(interval: int = KEEPALIVE_INTERVAL_SECONDS) -> None:
         except Exception as e:
             logging.warning(f"Supabase keep-alive failed: {e}")
         await asyncio.sleep(interval)
+
+
+def list_uploads_by_folder(telegram_id: int, folder_id: str) -> list[dict]:
+    """All history rows for one Drive folder, oldest first."""
+    resp = (
+        _supabase.table("uploads").select("*")
+        .eq("telegram_id", telegram_id).eq("folder_id", folder_id)
+        .order("created_at")
+        .execute()
+    )
+    return resp.data or []
+
+
+def set_folder_comment_file(telegram_id: int, folder_id: str, file_id: str | None) -> None:
+    _supabase.table("uploads").update({"comment_file_id": file_id}).eq(
+        "telegram_id", telegram_id).eq("folder_id", folder_id).execute()

@@ -1,4 +1,4 @@
-# PixKeep Bot (multi-user, multi-account, v5.19, Google Drive backend)
+# PixKeep Bot (multi-user, multi-account, v5.21, Google Drive backend)
 
 Чистит метаданные (EXIF/GPS/IPTC/XMP) из фото и файлов без потери качества и
 складывает результат на **Google Drive** пользователя. Каждый может
@@ -113,6 +113,12 @@ create index if not exists idx_uploads_telegram on uploads(telegram_id, created_
 ```sql
 alter table user_settings add column if not exists photo_fix text default 'off';
 alter table user_settings add column if not exists upload_list boolean default false;
+```
+
+**v5.20 — две новые колонки в `uploads`** (комментарии к папке):
+```sql
+alter table uploads add column if not exists comment text;
+alter table uploads add column if not exists comment_file_id text;
 ```
 
 **Если у тебя уже есть `user_settings` без колонки `replace_duplicates`**

@@ -9,6 +9,7 @@ API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
 
 Changelog:
+- v4.3: optional content_type for upload_file / replace_file_content (txt files).
 - v4.2: upload_file now returns the new file's id; added trash_file,
         folder_is_empty, revoke_public_access (for "Мои загрузки").
 - v4.1: added find_file_in_folder + replace_file_content, for the
@@ -76,7 +77,8 @@ async def ensure_folder(session: aiohttp.ClientSession, token: str,
 
 
 async def upload_file(session: aiohttp.ClientSession, token: str,
-                      local_path: str, folder_id: str, name: str) -> str:
+                      local_path: str, folder_id: str, name: str,
+                      content_type: str = "application/octet-stream") -> str:
     """Multipart upload of a single (modest-size) file into folder_id.
     Always creates a NEW file, even if one with this name already exists
     in folder_id — see find_file_in_folder/replace_file_content below for
@@ -90,7 +92,7 @@ async def upload_file(session: aiohttp.ClientSession, token: str,
         "metadata", json.dumps(metadata),
         content_type="application/json; charset=UTF-8",
     )
-    form.add_field("file", file_bytes, content_type="application/octet-stream")
+    form.add_field("file", file_bytes, content_type=content_type)
 
     async with session.post(
         f"{UPLOAD_API}/files", params={"uploadType": "multipart", "fields": "id"},
@@ -123,7 +125,8 @@ async def find_file_in_folder(session: aiohttp.ClientSession, token: str,
 
 
 async def replace_file_content(session: aiohttp.ClientSession, token: str,
-                               local_path: str, file_id: str) -> None:
+                               local_path: str, file_id: str,
+                               content_type: str = "application/octet-stream") -> None:
     """Overwrites an existing file's bytes in place — same file id, same
     share link, no duplicate. Used instead of upload_file when
     find_file_in_folder found a same-named file already there."""
@@ -131,7 +134,7 @@ async def replace_file_content(session: aiohttp.ClientSession, token: str,
         file_bytes = f.read()
     async with session.patch(
         f"{UPLOAD_API}/files/{file_id}", params={"uploadType": "media"},
-        data=file_bytes, headers=_headers(token),
+        data=file_bytes, headers={**_headers(token), "Content-Type": content_type},
     ) as resp:
         await _check(resp, ok=(200,))
 

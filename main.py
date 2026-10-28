@@ -1,8 +1,24 @@
 """
 main.py
-v5.19 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.21 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.21: приём ЛЮБЫХ файлов — теперь принимаются и видео, аудио, голосовые,
+        кружки и GIF (раньше только фото и документы; остальное молча
+        игнорировалось). Исправлено: (1) один не скачавшийся файл (напр.
+        больше 20 МБ — лимит Bot API) ронял всю пачку без единого сообщения;
+        теперь такие файлы перечисляются в отчёте, остальные грузятся, а
+        исходные сообщения непринятых файлов остаются в чате; (2) файлы с
+        одинаковым именем в одной пачке перезаписывали друг друга на диске
+        (и оба исходных сообщения удалялись) — теперь получают суффикс _2,
+        _3; (3) если exiftool не смог почистить файл, бот молча заливал его
+        как есть — теперь предупреждает в сообщении и помечает в txt-списке.
+- v5.20: комментарии к папке: кнопка «💬 Добавить комментарий» под отчётом
+        о загрузке и в карточке загрузки («Мои загрузки»). Текст сохраняется
+        в !COMMENT.txt (имя начинается с «!», чтобы файл был первым в списке)
+        — один файл на папку, комментарии дописываются с меткой времени.
+        Комментарий можно удалить из «Мои загрузки». REQUIRES две новые
+        колонки в uploads — SQL в README и в db.py.
 - v5.19: photo_fix переписан: решение «тёмное ли фото» и сила подъёма теперь
         считаются по теням (20-й процентиль яркости), а не по медиане, и
         используется кривая подъёма теней вместо общей гаммы. Раньше кадр с
@@ -247,7 +263,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.19"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.21"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -288,6 +304,8 @@ from db import (
     update_upload,
     delete_upload,
     delete_uploads_by_folder,
+    list_uploads_by_folder,
+    set_folder_comment_file,
     get_settings,
     set_setting,
     add_or_update_account,
@@ -424,6 +442,7 @@ async def _heartbeat(chat_id: int, action: str = ChatAction.UPLOAD_DOCUMENT):
 
 class Flow(StatesGroup):
     waiting_folder_name = State()
+    waiting_comment = State()
 
 
 # ---------------------------------------------------------------- commands ---
@@ -558,6 +577,9 @@ def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"📁 {u['folder_name']}\n{_fmt_dt(u['created_at'])} · файлов: {len(names)}\n"
         f"{access}\n\nФайлы: {shown}\n\n{u['link']}"
     )
+    comment = u.get("comment")
+    if comment:
+        text += "\n\n💬 Комментарий:\n" + (comment[:400] + ("…" if len(comment) > 400 else ""))
     uid = u["id"]
     kb = []
     if u.get("shared", True):
@@ -569,6 +591,9 @@ def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
     else:
         kb.append([InlineKeyboardButton(text="🔓 Открыть доступ по ссылке",
                                         callback_data=f"upsh:{uid}")])
+    kb.append([InlineKeyboardButton(text="💬 Добавить комментарий", callback_data=f"cmt:{uid}")])
+    if comment:
+        kb.append([InlineKeyboardButton(text="🧹 Удалить комментарий", callback_data=f"cmtdel:{uid}")])
     kb.append([InlineKeyboardButton(text="🗑 Удалить отдельные файлы", callback_data=f"upf:{uid}:0")])
     kb.append([InlineKeyboardButton(text="🗑 Удалить всю загрузку", callback_data=f"updel:{uid}")])
     kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="uplist")])
@@ -645,6 +670,166 @@ async def on_upload_share_toggle(cq: CallbackQuery):
     await cq.answer(note)
 
 
+COMMENT_FILE_NAME = "!COMMENT.txt"   # "!" sorts before digits and letters in Drive
+TXT_MIME = "text/plain; charset=utf-8"
+
+
+async def _sync_comment_file(account: dict, tg: int, folder_id: str) -> None:
+    """Rebuilds !COMMENT.txt in the folder from the comments of every
+    history row of that folder (one file per folder, oldest first). Creates
+    it, replaces its content, or trashes it when no comments are left."""
+    rows = list_uploads_by_folder(tg, folder_id)
+    comments = [r["comment"] for r in rows if r.get("comment")]
+    file_id = next((r["comment_file_id"] for r in rows if r.get("comment_file_id")), None)
+
+    if not comments:
+        if file_id:
+            await _with_drive(account, lambda s, t: trash_file(s, t, file_id))
+            set_folder_comment_file(tg, folder_id, None)
+        return
+
+    os.makedirs(config.TEMP_DIR, exist_ok=True)
+    path = os.path.join(config.TEMP_DIR, f"comment_{uuid.uuid4().hex}.txt")
+    with open(path, "w", encoding="utf-8-sig") as f:   # BOM: Windows Notepad reads Cyrillic
+        f.write("\n\n".join(comments) + "\n")
+    try:
+        done = False
+        if file_id:
+            try:
+                await _with_drive(account, lambda s, t: replace_file_content(
+                    s, t, path, file_id, TXT_MIME))
+                done = True
+            except RuntimeError as e:
+                if "404" not in str(e):   # file was removed by hand -> recreate below
+                    raise
+        if not done:
+            new_id = await _with_drive(account, lambda s, t: upload_file(
+                s, t, path, folder_id, COMMENT_FILE_NAME, TXT_MIME))
+            set_folder_comment_file(tg, folder_id, new_id)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _after_removal(account: dict, tg: int, folder_id: str) -> bool:
+    """Call once an upload's row is deleted and its files are trashed:
+    updates (or removes) the folder's comment file, then trashes the folder
+    if nothing is left in it. Returns True if the folder was trashed."""
+    try:
+        await _sync_comment_file(account, tg, folder_id)
+    except Exception:
+        logging.exception("comment file sync failed")
+
+    async def _chk(session, token):
+        if await folder_is_empty(session, token, folder_id):
+            await trash_file(session, token, folder_id)
+            return True
+        return False
+
+    return await _with_drive(account, _chk)
+
+
+async def _restore_state(state: FSMContext, prev: str | None) -> None:
+    await state.set_state(prev)
+    await state.update_data(comment_upload_id=None, comment_prev_state=None)
+
+
+@dp.callback_query(F.data.regexp(r"^cmt:\d+$"))
+async def on_comment_start(cq: CallbackQuery, state: FSMContext):
+    uid = int(cq.data.split(":")[1])
+    u = get_upload(cq.from_user.id, uid)
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    cur = await state.get_state()
+    if cur != Flow.waiting_comment.state:   # keep e.g. a pending folder-name question
+        await state.update_data(comment_prev_state=cur)
+    await state.update_data(comment_upload_id=uid)
+    await state.set_state(Flow.waiting_comment)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cmtx")],
+    ])
+    await cq.message.answer(
+        f"💬 Введите комментарий к папке «{u['folder_name']}» и отправьте одним сообщением.\n"
+        f"Он сохранится в файл {COMMENT_FILE_NAME} в этой папке. "
+        "Папка открыта всем, у кого есть ссылка, — комментарий они тоже увидят.",
+        reply_markup=kb,
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "cmtx")
+async def on_comment_cancel(cq: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if await state.get_state() == Flow.waiting_comment.state:
+        await _restore_state(state, data.get("comment_prev_state"))
+    await cq.message.edit_text("❌ Комментарий отменён.")
+    await cq.answer()
+
+
+@dp.message(Flow.waiting_comment, F.text, ~F.text.startswith("/"))
+async def on_comment_text(message: Message, state: FSMContext):
+    tg = message.from_user.id
+    data = await state.get_data()
+    prev = data.get("comment_prev_state")
+    uid = data.get("comment_upload_id")
+    text = message.text.strip()
+    u = get_upload(tg, uid) if uid else None
+    account = get_account_by_id(tg, u["account_id"]) if u else None
+    if not u or not account:
+        await _restore_state(state, prev)
+        await message.answer("Не нашёл эту загрузку или её аккаунт — комментарий не сохранён.")
+        return
+
+    block = f"[{datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}]\n{text}"
+    new_comment = f"{u['comment']}\n\n{block}" if u.get("comment") else block
+    try:
+        update_upload(tg, uid, comment=new_comment)
+    except Exception as e:
+        logging.exception("saving comment failed")
+        await _restore_state(state, prev)
+        await message.answer(f"Не удалось сохранить комментарий: {e}")
+        return
+    try:
+        await _sync_comment_file(account, tg, u["folder_id"])
+    except Exception as e:
+        logging.exception("comment upload failed")
+        await _restore_state(state, prev)
+        await message.answer(
+            f"Комментарий сохранён в боте, но в папку загрузить не удалось: {e}\n"
+            "Попробуй добавить ещё один комментарий — файл перезапишется целиком."
+        )
+        return
+    await _restore_state(state, prev)
+    await message.answer(f"💬 Сохранено в {COMMENT_FILE_NAME} (папка «{u['folder_name']}»).")
+
+
+@dp.callback_query(F.data.regexp(r"^cmtdel:\d+$"))
+async def on_comment_delete(cq: CallbackQuery):
+    tg = cq.from_user.id
+    uid = int(cq.data.split(":")[1])
+    u = get_upload(tg, uid)
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    account = await _account_for(cq, u)
+    if not account:
+        return
+    try:
+        update_upload(tg, uid, comment=None)
+        u["comment"] = None
+        await _sync_comment_file(account, tg, u["folder_id"])
+    except Exception as e:
+        logging.exception("comment delete failed")
+        await cq.answer(f"Ошибка: {e}"[:190], show_alert=True)
+        return
+    text, kb = _upload_detail_view(u)
+    await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await cq.answer("Комментарий удалён")
+
+
 FILES_PER_PAGE = 8
 
 
@@ -707,17 +892,16 @@ async def on_upload_file_delete(cq: CallbackQuery):
     folder_gone = False
 
     async def _do(session, token):
-        nonlocal folder_gone
         await trash_file(session, token, file_id)
         if not rest_real:
             for rf in rest:            # service txt list goes with the last file
                 await trash_file(session, token, rf["id"])
-        if not rest_real and await folder_is_empty(session, token, u["folder_id"]):
-            await trash_file(session, token, u["folder_id"])
-            folder_gone = True
 
     try:
         await _with_drive(account, _do)
+        if not rest_real:
+            delete_upload(tg, u["id"])
+            folder_gone = await _after_removal(account, tg, u["folder_id"])
     except Exception as e:
         logging.exception("delete single file failed")
         await cq.answer(f"Ошибка: {e}"[:190], show_alert=True)
@@ -726,8 +910,6 @@ async def on_upload_file_delete(cq: CallbackQuery):
     if not rest_real:
         if folder_gone:
             delete_uploads_by_folder(tg, u["folder_id"])
-        else:
-            delete_upload(tg, u["id"])
         await cq.message.edit_text("🗑 Файл удалён — это был последний в загрузке, она убрана из списка.")
         await cq.answer()
         return
@@ -788,14 +970,13 @@ async def on_upload_delete_do(cq: CallbackQuery):
     async def _all(session, token):
         failed.clear()
         await asyncio.gather(*[_one(session, token, f) for f in u["files"]])
-        folder_gone = False
-        if not failed and await folder_is_empty(session, token, u["folder_id"]):
-            await trash_file(session, token, u["folder_id"])
-            folder_gone = True
-        return folder_gone
 
+    folder_gone = False
     try:
-        folder_gone = await _with_drive(account, _all)
+        await _with_drive(account, _all)
+        if not failed:
+            delete_upload(tg, uid)
+            folder_gone = await _after_removal(account, tg, u["folder_id"])
     except Exception as e:
         logging.exception("delete upload failed")
         await cq.message.edit_text(f"Ошибка при удалении: {e}")
@@ -810,8 +991,6 @@ async def on_upload_delete_do(cq: CallbackQuery):
         return
     if folder_gone:
         delete_uploads_by_folder(tg, u["folder_id"])
-    else:
-        delete_upload(tg, uid)
     await cq.message.edit_text(
         "🗑 Удалено (в корзине Google Диска)."
         + (" Папка тоже." if folder_gone else " Папка осталась — в ней есть другие файлы.")
@@ -921,23 +1100,79 @@ async def on_cycle_photo_fix(cq: CallbackQuery):
 
 
 # ------------------------------------------------------------ media intake ---
-async def _download(message: Message, dest_dir: str) -> str | None:
-    if message.document:
-        file_id = message.document.file_id
-        file_name = message.document.file_name or f"{uuid.uuid4().hex}.jpg"
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        file_name = f"{uuid.uuid4().hex}.jpg"
-    else:
-        return None
+BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Bot API: bots can't download files > 20 MB
 
-    path = os.path.join(dest_dir, file_name)
-    file = await bot.get_file(file_id)
-    await bot.download_file(file.file_path, destination=path)
+
+def _media_info(message: Message) -> tuple[str, str, int | None] | None:
+    """(file_id, file_name, file_size) of whatever the message carries."""
+    u = uuid.uuid4().hex
+    if message.document:
+        d = message.document
+        return d.file_id, d.file_name or f"{u}.jpg", d.file_size
+    if message.photo:
+        p = message.photo[-1]
+        return p.file_id, f"{u}.jpg", p.file_size
+    if message.video:
+        v = message.video
+        return v.file_id, v.file_name or f"{u}.mp4", v.file_size
+    if message.audio:
+        a = message.audio
+        return a.file_id, a.file_name or f"{u}.mp3", a.file_size
+    if message.voice:
+        return message.voice.file_id, f"{u}.ogg", message.voice.file_size
+    if message.video_note:
+        return message.video_note.file_id, f"{u}.mp4", message.video_note.file_size
+    if message.animation:
+        an = message.animation
+        return an.file_id, an.file_name or f"{u}.mp4", an.file_size
+    return None
+
+
+class DownloadSkipped(Exception):
+    """A file that can't be fetched; str(e) is the reason shown to the user."""
+
+
+def _reserve_path(dest_dir: str, file_name: str) -> str:
+    """Atomically claims a unique file name inside dest_dir (name.ext,
+    name_2.ext, ...) so two files with the same name in one batch can't
+    overwrite each other."""
+    file_name = os.path.basename(file_name.replace("\\", "/")) or uuid.uuid4().hex
+    base, ext = os.path.splitext(file_name)
+    n = 1
+    while True:
+        candidate = file_name if n == 1 else f"{base}_{n}{ext}"
+        path = os.path.join(dest_dir, candidate)
+        try:
+            with open(path, "xb"):
+                return path
+        except FileExistsError:
+            n += 1
+
+
+async def _download(message: Message, dest_dir: str) -> str | None:
+    info = _media_info(message)
+    if not info:
+        return None
+    file_id, file_name, file_size = info
+    if file_size and file_size > BOT_API_DOWNLOAD_LIMIT:
+        raise DownloadSkipped(f"больше 20 МБ ({file_size // (1024 * 1024)} МБ) — лимит Telegram для ботов")
+
+    path = _reserve_path(dest_dir, file_name)
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, destination=path)
+    except Exception as e:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if "too big" in str(e).lower():
+            raise DownloadSkipped("больше 20 МБ — лимит Telegram для ботов")
+        raise DownloadSkipped(f"не скачался ({str(e)[:60]})")
     return path
 
 
-@dp.message(F.photo | F.document)
+@dp.message(F.photo | F.document | F.video | F.audio | F.voice | F.video_note | F.animation)
 async def handle_media(message: Message, state: FSMContext):
     if not get_active_account(message.from_user.id):
         await message.answer("Сначала подключи Google Drive командой /start.")
@@ -1016,6 +1251,15 @@ def _pick_folder_date(exif_dates: list, messages: list[Message]):
     return datetime.now(LOCAL_TZ).date()
 
 
+def _skipped_text(skipped: list[tuple[str, str]]) -> str:
+    lines = [f"⚠️ Не принял {len(skipped)} файл(ов):"]
+    for name, reason in skipped[:10]:
+        lines.append(f"• {name} — {reason}")
+    if len(skipped) > 10:
+        lines.append(f"… и ещё {len(skipped) - 10}")
+    return "\n".join(lines)
+
+
 async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     """Download each message's media, apply the user's standing settings
     (clean metadata / anonymize names — see /settings) immediately, and go
@@ -1039,9 +1283,21 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
     exif_sem = asyncio.Semaphore(EXIF_CONCURRENCY)
 
+    skipped: list[tuple[str, str]] = []   # (file name, reason) — not downloaded
+
     async def _download_bounded(msg: Message) -> str | None:
         async with dl_sem:
-            return await _download(msg, work_dir)
+            try:
+                return await _download(msg, work_dir)
+            except DownloadSkipped as e:
+                info = _media_info(msg)
+                skipped.append((info[1] if info else "?", str(e)))
+                return None
+            except Exception as e:
+                logging.exception("download failed")
+                info = _media_info(msg)
+                skipped.append((info[1] if info else "?", f"ошибка: {str(e)[:60]}"))
+                return None
 
     async def _inspect(it: dict) -> dict:
         async with exif_sem:
@@ -1055,6 +1311,7 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
             except Exception as e:
                 logging.error(f"strip failed {it['path']}: {e}")
                 shutil.copy(it["path"], out)
+                it["clean_failed"] = True
         it["upload_path"] = out
 
     # v5.9: this is the long silent stretch — download from Telegram, run
@@ -1078,7 +1335,10 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
             })
 
         if not items:
-            await bot.send_message(chat_id, "Не нашёл файлов для обработки.")
+            msg = "Не нашёл файлов для обработки."
+            if skipped:
+                msg = _skipped_text(skipped) + "\nИсходные сообщения оставил в чате."
+            await bot.send_message(chat_id, msg)
             shutil.rmtree(work_dir, ignore_errors=True)
             return
 
@@ -1129,6 +1389,12 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
             it["upload_name"] = it["orig_name"]
 
     note = f"Получил {len(items)} файл(ов)."
+    if skipped:
+        note += "\n" + _skipped_text(skipped) + "\n(их сообщения остаются в чате)"
+    unclean = [it["orig_name"] for it in items if it.get("clean_failed")]
+    if unclean:
+        note += (f"\n⚠️ Метаданные не удалось почистить (загружу как есть): "
+                 + ", ".join(unclean[:5]) + (f" и ещё {len(unclean) - 5}" if len(unclean) > 5 else ""))
     if gps_count:
         note += f"\n⚠️ В {gps_count} из них есть GPS-координаты съёмки."
     note += (
@@ -1340,6 +1606,8 @@ def _build_list_text(folder_name: str, results: list[dict], s: dict) -> str:
             line = f"{r['upload_name']} - {'edited' if r.get('edited') else 'original'}"
             if r.get("rotated"):
                 line += ", rotated upright"
+            if r.get("clean_failed"):
+                line += " [metadata NOT cleaned]"
             if r["upload_name"] != r["orig_name"]:
                 line += f" [was: {r['orig_name']}]"
         else:
@@ -1360,7 +1628,7 @@ async def _upload_list_file(account: dict, folder_id: str, folder_name: str,
         f.write(_build_list_text(folder_name, results, s))
     try:
         file_id = await _with_drive(
-            account, lambda sess, tok: upload_file(sess, tok, path, folder_id, name)
+            account, lambda sess, tok: upload_file(sess, tok, path, folder_id, name, TXT_MIME)
         )
     finally:
         try:
@@ -1433,22 +1701,25 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     # (Bot API 7.x+) whose only job is "put this exact string on the
     # clipboard when tapped", so we add it alongside the text link rather
     # than instead of it — one tap to open, or one tap on the button to copy.
-    reply_markup = None
-    if succeeded:
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))],
-        ])
-    await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
-
+    upload_row_id = None
     if succeeded:
         try:
-            save_upload(
+            upload_row_id = save_upload(
                 telegram_id, account["id"], folder_id, folder_name.strip(), link,
                 [{"id": r["file_id"], "name": r["upload_name"]} for r in succeeded]
                 + ([report_entry] if report_entry else []),
             )
         except Exception:
             logging.exception("couldn't record upload in history")
+
+    reply_markup = None
+    if succeeded:
+        rows = [[InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))]]
+        if upload_row_id:
+            rows.append([InlineKeyboardButton(text="💬 Добавить комментарий",
+                                              callback_data=f"cmt:{upload_row_id}")])
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
     # Delete original chat messages only for files that actually uploaded.
     # v5.13: v5.12 wrapped this in the TYPING chat-action to give some sign
