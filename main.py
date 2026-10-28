@@ -192,6 +192,9 @@ Changelog (полный список по версиям — в CHANGELOG.md):
         a slow upload from the phone (weak signal, large files) creates a
         >2s gap between messages and triggers a premature split in the
         first place.
+- v5.26: Drive retries with backoff (429/5xx/network), OAuth state TTL and HTML
+        result page, "access revoked" message with a reconnect button, per-batch
+        size cap (MAX_BATCH_MB), /help, ADMIN_IDS.
 - v5.4: added /version — replies with the running code's version string.
         Added purely as a deployment diagnostic: several rounds of "the
         feature isn't there" turned out to be Render still running an old
@@ -276,7 +279,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.25"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.26"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -341,6 +344,7 @@ from drive_utils import (
     replace_file_content,
     publish_and_get_url,
     GoogleAuthError,
+    new_session,
     trash_file,
     folder_is_empty,
     revoke_public_access,
@@ -351,7 +355,10 @@ from drive_utils import (
     get_file_meta,
     download_file,
 )
-from oauth import build_auth_url, exchange_code, refresh_access_token, get_user_email
+from oauth import (
+    build_auth_url, exchange_code, refresh_access_token, get_user_email,
+    TokenRevokedError,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -360,13 +367,13 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 class IsAdmin(BaseFilter):
-    """Global gate: only config.ADMIN_ID may use the bot. Everyone else's
+    """Global gate: only config.ADMIN_IDS may use the bot. Everyone else's
     messages/callbacks are simply not handled — no reply, no acknowledgment
     that the bot exists or does anything. Applied once here to the whole
     dispatcher, so every handler below is covered automatically."""
     async def __call__(self, event) -> bool:
         user = event.from_user
-        return user is not None and user.id == config.ADMIN_ID
+        return user is not None and user.id in config.ADMIN_IDS
 
 
 dp.message.filter(IsAdmin())
@@ -629,7 +636,7 @@ def _fmt_dt(iso: str) -> str:
 async def _with_drive(account: dict, fn):
     """Runs `await fn(session, token)`; on a 401 refreshes the token once
     (and stores it) and retries."""
-    async with aiohttp.ClientSession() as session:
+    async with new_session() as session:
         try:
             return await fn(session, account["access_token"])
         except GoogleAuthError:
@@ -1212,6 +1219,26 @@ async def logout(message: Message):
     )
 
 
+HELP_TEXT = (
+    "PixKeep — загружаю твои фото и файлы на Google Диск.\n\n"
+    "Как пользоваться: пришли файлы (можно альбомом или документами), "
+    "напиши имя папки — и я загружу их, а исходные сообщения удалю из чата.\n\n"
+    "/start — подключить Диск, статус\n"
+    "/uploads — мои загрузки: ссылки, комментарии, удаление\n"
+    "/accounts — аккаунты и свободное место\n"
+    "/settings — чистка метаданных, имена, коррекция тёмных фото, дубликаты\n"
+    "/logout — отключить все аккаунты\n"
+    "/version — версия кода\n\n"
+    "Лимиты: Telegram даёт ботам скачивать файлы до 20 МБ; за одну пачку — "
+    f"не больше {config.MAX_BATCH_MB} МБ."
+)
+
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(HELP_TEXT)
+
+
 @dp.message(Command("version"))
 async def version_cmd(message: Message):
     """Diagnostic: confirms which code is actually running on the server,
@@ -1488,9 +1515,16 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     exif_sem = asyncio.Semaphore(EXIF_CONCURRENCY)
 
     skipped: list[tuple[str, str]] = []   # (file name, reason) — not downloaded
+    budget = [config.MAX_BATCH_MB * 1024 * 1024]   # bytes still allowed in this batch
 
     async def _download_bounded(msg: Message) -> str | None:
         async with dl_sem:
+            info = _media_info(msg)
+            size = (info[2] or 0) if info else 0
+            if size > budget[0]:
+                skipped.append((info[1], f"пачка больше {config.MAX_BATCH_MB} МБ — пришли отдельно"))
+                return None
+            budget[0] -= size
             try:
                 return await _download(msg, work_dir)
             except DownloadSkipped as e:
@@ -1781,7 +1815,7 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
     sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
     results: list[dict | None] = [None] * len(items)
 
-    async with aiohttp.ClientSession() as session:
+    async with new_session() as session:
         try:
             folder_id = await ensure_folder(session, access_token, folder_name)
         except GoogleAuthError:
@@ -1996,6 +2030,17 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
         async with _heartbeat(chat_id):
             results, link, folder_id = await _upload_all(
                 account, items, folder_name, replace_duplicates, on_progress)
+    except TokenRevokedError:
+        await _drop_status()
+        await bot.send_message(
+            chat_id,
+            "Google отозвал доступ к этому аккаунту. Подключи его заново — "
+            "файлы из этой пачки придётся прислать ещё раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="🔗 Подключить заново", url=build_auth_url(telegram_id))]]),
+        )
+        _cleanup()
+        return
     except Exception as e:
         logging.exception("upload failed")
         await _drop_status()
@@ -2159,12 +2204,32 @@ async def on_folder_pick(cq: CallbackQuery, state: FSMContext):
 
 
 # ------------------------------------------------------- oauth web server ----
+def _oauth_page(ok: bool, text: str) -> web.Response:
+    import html
+    color = "#1a7f37" if ok else "#c62828"
+    icon = "✅" if ok else "⚠️"
+    body = (
+        "<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>PixKeep</title><style>"
+        "body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;"
+        "align-items:center;justify-content:center;margin:0;padding:16px;"
+        "background:#f6f7f9;color:#222}"
+        "@media(prefers-color-scheme:dark){body{background:#16181c;color:#eee}}"
+        ".c{max-width:420px;text-align:center}.i{font-size:56px}"
+        f"h1{{font-size:22px;color:{color}}}</style></head><body><div class='c'>"
+        f"<div class='i'>{icon}</div><h1>{'Готово' if ok else 'Не получилось'}</h1>"
+        f"<p>{html.escape(text)}</p><p>Можно вернуться в Telegram.</p></div></body></html>"
+    )
+    return web.Response(text=body, content_type="text/html", status=200 if ok else 400)
+
+
 async def oauth_callback(request: web.Request) -> web.Response:
     state = request.query.get("state", "")
     code = request.query.get("code", "")
     error = request.query.get("error")
     if error:
-        return web.Response(text=f"Отказано в доступе: {error}", content_type="text/plain")
+        return _oauth_page(False, f"Доступ не предоставлен ({error}).")
     try:
         telegram_id, access_token, refresh_token = await exchange_code(state, code)
         email = await get_user_email(access_token)
@@ -2173,13 +2238,10 @@ async def oauth_callback(request: web.Request) -> web.Response:
             telegram_id,
             f"Google Drive подключён ✅ ({email})\nТеперь пришли фото или файлы."
         )
-        return web.Response(
-            text="Готово! Диск подключён. Можешь вернуться в Telegram.",
-            content_type="text/plain",
-        )
+        return _oauth_page(True, f"Диск {email} подключён.")
     except Exception as e:
         logging.exception("oauth callback failed")
-        return web.Response(text=f"Ошибка авторизации: {e}", content_type="text/plain")
+        return _oauth_page(False, str(e)[:200])
 
 
 async def health(_request: web.Request) -> web.Response:
@@ -2204,6 +2266,7 @@ BOT_COMMANDS = [
     BotCommand(command="accounts", description="Аккаунты: список и переключение"),
     BotCommand(command="settings", description="Настройки очистки и переименования"),
     BotCommand(command="logout", description="Отключить все аккаунты"),
+    BotCommand(command="help", description="Справка"),
     BotCommand(command="version", description="Какая версия кода сейчас работает"),
 ]
 

@@ -2,13 +2,13 @@
 drive_utils.py
 v4.1 - Google Drive v3 REST API helpers (async, aiohttp, no Google client libs)
 
-Mirrors the shape of the previous Yandex disk_utils.py so main.py's overall
-flow barely has to change: ensure_folder / upload_file / publish_and_get_url.
-
 API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
 
 Changelog:
+- v4.6: new_session() — a ClientSession that retries 429/5xx and network
+        errors with exponential backoff (honours Retry-After); upload_file
+        rebuilds its multipart body for every attempt.
 - v4.5: list_folder_md5 also returns name -> md5s (duplicate skipping vs. replace_duplicates).
 - v4.4: get_quota, list_folder_md5, list_recent_folders, rename_file,
         get_file_meta, download_file (quota display, duplicate skipping,
@@ -22,12 +22,68 @@ Changelog:
         upload_file (Drive's default: filenames aren't unique, so uploading
         the same file twice used to just leave two copies behind).
 """
+import asyncio
 import json
+import logging
+import random
 
 import aiohttp
 
 API = "https://www.googleapis.com/drive/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4          # 1 try + 3 retries
+BACKOFF_BASE = 1.0        # 1s, 2s, 4s (+ jitter)
+BACKOFF_CAP = 20.0
+
+
+def _delay(attempt: int, retry_after: str | None) -> float:
+    if retry_after:
+        try:
+            return min(float(retry_after), BACKOFF_CAP)
+        except ValueError:
+            pass
+    return min(BACKOFF_BASE * 2 ** attempt, BACKOFF_CAP) + random.uniform(0, 0.5)
+
+
+# aiohttp warns that subclassing ClientSession is "discouraged"; the version is
+# pinned in requirements.txt and tests/test_drive_retry.py covers this class.
+class RetrySession(aiohttp.ClientSession):
+    """ClientSession that transparently retries transient failures.
+
+    Retried: HTTP 429/5xx and network errors/timeouts. NOT retried: requests
+    with a one-shot body (FormData / streams) — callers rebuild those
+    themselves (see upload_file)."""
+
+    async def _request(self, method, str_or_url, **kwargs):
+        data = kwargs.get("data")
+        retryable = not isinstance(data, (aiohttp.FormData, aiohttp.StreamReader)) \
+            and not hasattr(data, "__aiter__")
+        attempts = MAX_ATTEMPTS if retryable else 1
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            try:
+                resp = await super()._request(method, str_or_url, **kwargs)
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                if last:
+                    raise
+                wait = _delay(attempt, None)
+                logging.warning("Drive %s network error (%s), retry in %.1fs", method, e, wait)
+                await asyncio.sleep(wait)
+                continue
+            if resp.status in RETRY_STATUSES and not last:
+                wait = _delay(attempt, resp.headers.get("Retry-After"))
+                logging.warning("Drive %s -> %s, retry in %.1fs", method, resp.status, wait)
+                resp.release()
+                await asyncio.sleep(wait)
+                continue
+            return resp
+
+
+def new_session() -> aiohttp.ClientSession:
+    return RetrySession(timeout=aiohttp.ClientTimeout(total=300, connect=20))
 
 
 class GoogleAuthError(Exception):
@@ -91,19 +147,31 @@ async def upload_file(session: aiohttp.ClientSession, token: str,
     with open(local_path, "rb") as f:
         file_bytes = f.read()
 
-    form = aiohttp.FormData()
-    form.add_field(
-        "metadata", json.dumps(metadata),
-        content_type="application/json; charset=UTF-8",
-    )
-    form.add_field("file", file_bytes, content_type=content_type)
-
-    async with session.post(
-        f"{UPLOAD_API}/files", params={"uploadType": "multipart", "fields": "id"},
-        data=form, headers=_headers(token),
-    ) as resp:
-        await _check(resp, ok=(200, 201))
-        return (await resp.json())["id"]
+    for attempt in range(MAX_ATTEMPTS):
+        last = attempt == MAX_ATTEMPTS - 1
+        form = aiohttp.FormData()
+        form.add_field(
+            "metadata", json.dumps(metadata),
+            content_type="application/json; charset=UTF-8",
+        )
+        form.add_field("file", file_bytes, content_type=content_type)
+        try:
+            async with session.post(
+                f"{UPLOAD_API}/files",
+                params={"uploadType": "multipart", "fields": "id"},
+                data=form, headers=_headers(token),
+            ) as resp:
+                if resp.status in RETRY_STATUSES and not last:
+                    wait = _delay(attempt, resp.headers.get("Retry-After"))
+                else:
+                    await _check(resp, ok=(200, 201))
+                    return (await resp.json())["id"]
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            if last:
+                raise
+            wait = _delay(attempt, None)
+        logging.warning("Drive upload retry %d in %.1fs", attempt + 1, wait)
+        await asyncio.sleep(wait)
 
 
 async def find_file_in_folder(session: aiohttp.ClientSession, token: str,

@@ -1,4 +1,4 @@
-aiogram
-aiohttp
-supabase
-Pillow
+aiogram==3.31.0
+aiohttp==3.14.5
+supabase==2.33.0
+Pillow==12.3.0

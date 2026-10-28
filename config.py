@@ -3,6 +3,7 @@ config.py
 v5.0 - central configuration (Google Drive backend, multi-account, admin-only access)
 
 Changelog:
+- v5.26: ADMIN_IDS (comma-separated, ADMIN_ID still works), MAX_BATCH_MB.
 - v5.0: added ADMIN_ID — only this Telegram user ID can use the bot at all.
         Everyone else is silently ignored at the dispatcher level, before
         any handler (including /start) even runs.
@@ -21,7 +22,16 @@ class Config:
 
     # Only this Telegram user ID may use the bot at all — everyone else is
     # silently ignored (no reply, no acknowledgment the bot even exists).
-    ADMIN_ID = int(os.environ["ADMIN_ID"])
+    # v5.26: ADMIN_IDS may hold several comma-separated IDs; the old single
+    # ADMIN_ID variable keeps working.
+    ADMIN_IDS = {
+        int(x) for x in
+        (os.environ.get("ADMIN_IDS") or os.environ["ADMIN_ID"]).replace(" ", "").split(",")
+        if x
+    }
+
+    # v5.26: per-batch cap on downloaded bytes (protects the small Render disk).
+    MAX_BATCH_MB = int(os.environ.get("MAX_BATCH_MB", "300"))
 
     # One Google Cloud OAuth "Web application" client, shared by all users.
     # Each user authorizes their OWN Google Drive via the consent screen.

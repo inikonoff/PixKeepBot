@@ -7,7 +7,7 @@ Telegram-бот для администратора (`ADMIN_ID`): принима
 входа у получателя) и честный отчёт: что загрузилось, что нет, что оказалось
 дубликатом.
 
-Текущая версия — v5.25 (`/version` покажет, какая реально запущена).
+Текущая версия — v5.26 (`/version` покажет, какая реально запущена).
 История изменений с первой версии — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
@@ -65,6 +65,7 @@ quality 95, цветовой профиль сохраняется.
 - `/uploads` или кнопка «📂 Мои загрузки» — последние загрузки
 - `/logout` — удалить ВСЕ подключённые аккаунты и историю загрузок (доступ
   можно также отозвать на myaccount.google.com/permissions)
+- `/help` — краткая справка
 - `/version` — какая версия кода запущена
 
 ## Настройки (`/settings`)
@@ -156,7 +157,9 @@ alter table user_settings add column if not exists upload_list boolean default f
 alter table uploads add column if not exists comment text;
 alter table uploads add column if not exists comment_file_id text;
 ```
-Версии 5.23–5.25 новых колонок не требуют.
+Версии 5.23–5.26 новых колонок не требуют. Необязательный индекс для
+быстрых запросов по папке лежит в `migrations/001_indexes.sql` (выполни его
+в SQL Editor один раз; повторный запуск безопасен).
 
 Если обновляешься со старой схемы (таблица `disk_users`) — данные не
 переносятся: создай новые таблицы, задеплой код, подключи аккаунты заново;
@@ -170,7 +173,11 @@ alter table uploads add column if not exists comment_file_id text;
 Задеплой репозиторий (Dockerfile нужен ради `exiftool`). Переменные:
 - `BOT_TOKEN`
 - `ADMIN_ID` — только этот пользователь может пользоваться ботом, остальные
-  игнорируются на уровне диспетчера (даже `/start` не ответит)
+  игнорируются на уровне диспетчера (даже `/start` не ответит). Можно задать
+  нескольких через запятую в `ADMIN_IDS` (`ADMIN_IDS=111,222`), тогда
+  `ADMIN_ID` не нужен
+- `MAX_BATCH_MB` (необязательно, по умолчанию 300) — максимум скачиваемого за
+  одну пачку; остальное бот пропустит и сообщит в отчёте
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
 - `OAUTH_REDIRECT_URI` = `https://<твой-домен>.onrender.com/oauth/callback`
   (ровно как в Google Cloud Console)
@@ -216,6 +223,14 @@ alter table uploads add column if not exists comment_file_id text;
 - История загрузок хранится в Supabase (последние 20 записей на
   пользователя; записи с комментариями не вычищаются при ротации).
 
+## Надёжность
+- Запросы к Google Drive при ошибках 429/5xx и сетевых сбоях повторяются до
+  3 раз с нарастающей паузой (учитывается `Retry-After`).
+- Ссылка авторизации Google действует 10 минут; страница после авторизации
+  показывает результат, а если Google отозвал доступ к аккаунту, бот пришлёт
+  кнопку «Подключить заново».
+- Зависимости закреплены в `requirements.txt`, контейнер работает не от root.
+
 ## Файлы проекта
 | Файл | Назначение |
 |---|---|
@@ -225,5 +240,6 @@ alter table uploads add column if not exists comment_file_id text;
 | `photo_fix.py` | поворот по EXIF и автокоррекция теней (Pillow) |
 | `exif_utils.py` | инспекция и чистка метаданных через exiftool |
 | `oauth.py`, `config.py` | OAuth-поток Google, переменные окружения |
-| `disk_utils.py` | старый модуль Яндекс.Диска, не используется |
+| `migrations/` | SQL для Supabase (индексы) |
+| `tests/` | автотесты (`pip install -r requirements-dev.txt && pytest tests`), CI в `.github/workflows` |
 | `CHANGELOG.md` | история версий с первой |
