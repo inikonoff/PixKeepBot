@@ -1,71 +1,7 @@
 """
-db.py
-v5.3 - multiple Google accounts per Telegram user + standing settings, in Supabase
-
-Tables (create once, SQL in README):
-    user_settings(telegram_id bigint primary key,
-                  clean_metadata boolean default true,
-                  anonymize_names boolean default false,
-                  auto_date_folder boolean default false,
-                  replace_duplicates boolean default false)
-
-    google_accounts(id bigserial primary key,
-                    telegram_id bigint not null,
-                    email text not null,
-                    access_token text not null,
-                    refresh_token text not null,
-                    is_active boolean not null default false,
-                    created_at timestamptz default now(),
-                    unique (telegram_id, email))
-
-    uploads(id bigserial primary key,
-            telegram_id bigint not null,
-            account_id bigint not null,
-            folder_id text not null,
-            folder_name text not null,
-            link text not null,
-            files jsonb not null default '[]',
-            shared boolean not null default true,
-            created_at timestamptz default now())
-
-Changelog:
-- v5.8: rename_folder_rows (rename a folder from «Мои загрузки»).
-- v5.7: folder comments — uploads.comment / uploads.comment_file_id,
-        list_uploads_by_folder, set_folder_comment_file; save_upload returns
-        the new row id; pruning never drops rows that carry a comment.
-        REQUIRED migration before deploying v5.20:
-        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comment text;
-        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comment_file_id text;
-- v5.6: settings photo_fix (text: off/auto/always) and upload_list (boolean).
-        REQUIRED migration before deploying v5.17:
-        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS photo_fix text default 'off';
-        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS upload_list boolean default false;
-- v5.5: "Мои загрузки" — uploads table + save/list/get/update/delete helpers,
-        get_account_by_id; logout also clears the user's uploads.
-- v5.4: keep_alive_loop() — periodic lightweight query so the free Supabase
-        project is never auto-paused for inactivity (see main.py v5.14); 10 min interval, same as voice_bot.
-- v5.3: added replace_duplicates setting — when on, uploading a file whose
-        name already exists in the target Drive folder overwrites that
-        file in place instead of leaving a second copy with the same name
-        (Drive's default, since filenames there are just metadata, not a
-        unique path). Off by default: matches the bot's existing behavior
-        for everyone until they opt in.
-        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS
-        replace_duplicates boolean default false;
-- v5.2: BUGFIX — get_settings() was still SELECTing only the original two
-        columns, so auto_date_folder (added in v5.1) never actually came
-        back from Supabase; it silently fell back to its default every
-        time, which is why the /settings checkbox never reflected a real
-        toggle. Select list is now built from DEFAULT_SETTINGS.keys() so
-        this can't go stale again when a future setting is added.
-- v5.1: added auto_date_folder setting — when on, the bot skips asking for
-        a folder name and creates/uses one named after the files' capture
-        date (DD.MM.YY) automatically.
-- v5.0: split into two tables — settings are independent of which Google
-        account is active, and a user can now have several connected
-        accounts with exactly one marked is_active at a time.
-- v4.1: single-account disk_users table (access_token/refresh_token +
-        clean_metadata/anonymize_names all in one row per telegram_id).
+Supabase storage: per-user settings, connected Google accounts (exactly one
+active), upload history ("Мои загрузки") and the keep-alive ping.
+Full schema and migrations: README.md ("Supabase").
 """
 import asyncio
 import logging

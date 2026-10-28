@@ -1,11 +1,5 @@
 """
-exif_utils.py
-v2.0 - inspect + strip metadata via exiftool (no recompression, pixels untouched)
-
-Changelog:
-- v2.0: added inspect_metadata() so the bot can report what it found/removed
-        (GPS, camera, capture date, software) before stripping.
-- v1.0: strip_exif via `exiftool -all=`.
+Inspect + strip metadata via exiftool (no recompression, pixels untouched).
 """
 import json
 import subprocess

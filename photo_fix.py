@@ -1,6 +1,5 @@
 """
-photo_fix.py
-v1.1 - "auto" brightness / shadow lift for dark photos (Pillow only, no numpy)
+"Auto" brightness / shadow lift for dark photos (Pillow only, no numpy)
 
 Modes (user setting `photo_fix`):
     off     - never touch pixels
@@ -21,7 +20,6 @@ removed afterwards by the normal metadata-cleaning step if that is enabled).
 normalize_orientation(): rotates pixels according to the EXIF Orientation tag
 (used when metadata cleaning is on, since cleaning drops that tag).
 """
-import math
 import os
 
 from PIL import Image, ImageOps, ImageStat, JpegImagePlugin
