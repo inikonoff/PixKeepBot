@@ -9,6 +9,7 @@ API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
 
 Changelog:
+- v4.5: list_folder_md5 also returns name -> md5s (duplicate skipping vs. replace_duplicates).
 - v4.4: get_quota, list_folder_md5, list_recent_folders, rename_file,
         get_file_meta, download_file (quota display, duplicate skipping,
         folder suggestions, rename, "send file to chat").
@@ -211,10 +212,12 @@ async def get_quota(session: aiohttp.ClientSession, token: str) -> tuple[int, in
 
 
 async def list_folder_md5(session: aiohttp.ClientSession, token: str,
-                          folder_id: str) -> dict[str, str]:
-    """md5 -> file name for every non-trashed file directly inside folder_id
-    (only files this app can see, i.e. the ones it created)."""
+                          folder_id: str) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """For every non-trashed file directly inside folder_id (only files this
+    app can see, i.e. the ones it created) returns two maps:
+    md5 -> file name, and file name -> set of md5s."""
     out: dict[str, str] = {}
+    by_name: dict[str, set[str]] = {}
     page = None
     while True:
         params = {
@@ -230,9 +233,10 @@ async def list_folder_md5(session: aiohttp.ClientSession, token: str,
         for f in data.get("files", []):
             if f.get("md5Checksum"):
                 out.setdefault(f["md5Checksum"], f["name"])
+                by_name.setdefault(f["name"], set()).add(f["md5Checksum"])
         page = data.get("nextPageToken")
         if not page:
-            return out
+            return out, by_name
 
 
 async def list_recent_folders(session: aiohttp.ClientSession, token: str,

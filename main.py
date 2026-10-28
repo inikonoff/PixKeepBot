@@ -1,8 +1,13 @@
 """
 main.py
-v5.23 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.25 - PixKeep Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog (полный список по версиям — в CHANGELOG.md):
+- v5.25: пропуск дубликатов больше не мешает «Заменять файлы с таким же именем»:
+        если файл с этим именем уже есть, но с другим содержимым, новая версия
+        заменяет его, даже если такие же байты лежат в папке под другим именем.
+- v5.24: строка про пропущенные дубликаты в отчёте сокращена: «♻️ Пропущено
+        как дубликаты (N): имена через запятую» — без «= другой файл» в скобках.
 - v5.23: (1) свободное место по аккаунтам в /accounts, предупреждение перед
         загрузкой и строка «💾 занято» в отчёте (Drive about.get; при отказе
         Google — «?»); (2) пропуск дубликатов по md5 (внутри пачки и в
@@ -271,7 +276,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.23"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.25"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -1787,18 +1792,24 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
         # inside this batch) — compared by md5 against Drive's md5Checksum.
         try:
             try:
-                known = await list_folder_md5(session, access_token, folder_id)
+                known, names_in_folder = await list_folder_md5(session, access_token, folder_id)
             except GoogleAuthError:
                 access_token = await refresh_once()
-                known = await list_folder_md5(session, access_token, folder_id)
+                known, names_in_folder = await list_folder_md5(session, access_token, folder_id)
         except Exception as e:
             logging.warning(f"duplicate check against folder skipped: {e}")
-            known = {}
+            known, names_in_folder = {}, {}
         hashes = await asyncio.gather(*[asyncio.to_thread(_md5_file, it["upload_path"]) for it in items])
         seen = dict(known)
         to_upload: list[int] = []
         for i, (it, h) in enumerate(zip(items, hashes)):
-            if h in seen:
+            # "Заменять файлы с таким же именем" wins over content-skipping: if
+            # a file with this very name already exists with DIFFERENT content,
+            # the new content must replace it, even when the same bytes also
+            # sit in the folder under another name.
+            wants_replace = (replace_duplicates and it["upload_name"] in names_in_folder
+                             and h not in names_in_folder[it["upload_name"]])
+            if h in seen and not wants_replace:
                 results[i] = {**it, "success": True, "error": None,
                               "file_id": None, "duplicate_of": seen[h]}
             else:
@@ -2016,9 +2027,8 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
         names = ", ".join(r["upload_name"] for r in uploaded)
         lines.append(f"✅ Загружено ({len(uploaded)}): {names}")
     if dups:
-        shown = ", ".join(f"{r['upload_name']} (= {r['duplicate_of']})" for r in dups[:5])
-        more = f" и ещё {len(dups) - 5}" if len(dups) > 5 else ""
-        lines.append(f"♻️ Уже есть в папке, пропущено ({len(dups)}): {shown}{more}")
+        names = ", ".join(r["upload_name"] for r in dups)
+        lines.append(f"♻️ Пропущено как дубликаты ({len(dups)}): {names}")
     if failed:
         names = ", ".join(r["orig_name"] for r in failed)
         lines.append(f"❌ Не удалось загрузить ({len(failed)}): {names}")
