@@ -11,6 +11,7 @@ import os
 import shutil
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 
 from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
@@ -167,11 +168,89 @@ async def _expire_retry(token: str) -> None:
         shutil.rmtree(entry["work_dir"], ignore_errors=True)
 
 
+@dataclass
+class Outcome:
+    """What one upload of a prepared batch achieved (see upload_and_record)."""
+    results: list[dict]
+    link: str
+    folder_id: str
+    folder_name: str
+    email: str
+    upload_row_id: int | None = None
+    report_entry: dict | None = None
+    list_failed: bool = False
+    quota: tuple | None = None
+
+    @property
+    def succeeded(self) -> list[dict]:     # on Drive (new or already there)
+        return [r for r in self.results if r["success"]]
+
+    @property
+    def uploaded(self) -> list[dict]:
+        return [r for r in self.succeeded if not r.get("duplicate_of")]
+
+    @property
+    def duplicates(self) -> list[dict]:
+        return [r for r in self.succeeded if r.get("duplicate_of")]
+
+    @property
+    def failed(self) -> list[dict]:
+        return [r for r in self.results if not r["success"]]
+
+
+async def upload_and_record(account: dict, telegram_id: int, items: list[dict], folder_name: str,
+                            work_dir: str | None, on_progress=None) -> Outcome:
+    """Shared by the immediate and the scheduled flow: upload, put the optional
+    txt list next to the files, record the upload in «Мои загрузки».
+    Raises TokenRevokedError / other errors of the upload itself."""
+    user_settings = await db.get_settings(telegram_id)
+    results, link, folder_id = await upload_all(
+        account, items, folder_name, user_settings["replace_duplicates"], on_progress)
+    out = Outcome(results=results, link=link, folder_id=folder_id,
+                  folder_name=folder_name.strip(), email=account["email"])
+
+    if user_settings["upload_list"] and out.succeeded:
+        try:
+            out.report_entry = await upload_list_file(
+                account, folder_id, folder_name, results, user_settings, work_dir or config.TEMP_DIR)
+        except Exception:
+            logging.exception("couldn't upload txt list")
+            out.list_failed = True
+
+    if out.succeeded:
+        out.quota = await account_quota(account, fresh=True)
+    if out.uploaded:
+        try:
+            out.upload_row_id = await db.save_upload(
+                telegram_id, account["id"], folder_id, out.folder_name, link,
+                [{"id": r["file_id"], "name": r["upload_name"]} for r in out.uploaded]
+                + ([out.report_entry] if out.report_entry else []),
+            )
+        except Exception:
+            logging.exception("couldn't record upload in history")
+    return out
+
+
+async def delete_sources(chat_id: int, results: list[dict]) -> int:
+    """Deletes the source messages of files that are on Drive. Returns how
+    many couldn't be deleted."""
+    not_deleted = 0
+    for r in results:
+        if not r["success"]:
+            continue
+        try:
+            await bot.delete_message(chat_id, r["message_id"])
+        except Exception as e:
+            logging.warning(f"couldn't delete message {r['message_id']}: {e}")
+            not_deleted += 1
+    return not_deleted
+
+
 async def deliver(chat_id: int, telegram_id: int, items: list[dict],
                   work_dir: str | None, folder_name: str) -> None:
-    """Upload (with live progress), report per-file success/failure, delete
-    source messages of what got to Drive, keep failed files for retry, clean
-    up temp files."""
+    """Immediate flow: upload with live progress, report per-file
+    success/failure, delete source messages of what got to Drive, keep failed
+    files for retry, clean up temp files."""
     def _cleanup() -> None:
         if work_dir and os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -208,19 +287,16 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
         with contextlib.suppress(Exception):
             await status.delete()
 
-    user_settings = await db.get_settings(telegram_id)
     try:
         async with heartbeat(chat_id):
-            results, link, folder_id = await upload_all(
-                account, items, folder_name, user_settings["replace_duplicates"], on_progress)
+            out = await upload_and_record(account, telegram_id, items, folder_name, work_dir, on_progress)
     except TokenRevokedError:
         await _drop_status()
         await bot.send_message(
             chat_id,
             "Google отозвал доступ к этому аккаунту. Подключи его заново — "
             "файлы из этой пачки придётся прислать ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="🔗 Подключить заново", url=build_auth_url(telegram_id))]]),
+            reply_markup=reconnect_keyboard(telegram_id),
         )
         _cleanup()
         return
@@ -232,69 +308,38 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
         return
     await _drop_status()
 
-    succeeded = [r for r in results if r["success"]]            # on Drive (new or already there)
-    uploaded = [r for r in succeeded if not r.get("duplicate_of")]
-    failed = [r for r in results if not r["success"]]
-
-    # Optional txt list of the batch, uploaded next to the files.
-    report_entry = None
-    list_failed = False
-    if user_settings["upload_list"] and succeeded:
-        try:
-            report_entry = await upload_list_file(
-                account, folder_id, folder_name, results, user_settings,
-                work_dir or config.TEMP_DIR)
-        except Exception:
-            logging.exception("couldn't upload txt list")
-            list_failed = True
-
-    quota = await account_quota(account, fresh=True) if succeeded else None
-    report = texts.upload_report(results, folder_name, link, report_entry, list_failed,
-                                 account["email"], quota)
-
-    upload_row_id = None
-    if uploaded:
-        try:
-            upload_row_id = await db.save_upload(
-                telegram_id, account["id"], folder_id, folder_name.strip(), link,
-                [{"id": r["file_id"], "name": r["upload_name"]} for r in uploaded]
-                + ([report_entry] if report_entry else []),
-            )
-        except Exception:
-            logging.exception("couldn't record upload in history")
-
+    report = texts.upload_report(out.results, folder_name, out.link, out.report_entry,
+                                 out.list_failed, out.email, out.quota)
     rows = []
-    if succeeded:
-        rows.append([InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))])
-        if upload_row_id:
+    if out.succeeded:
+        rows.append([InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=out.link))])
+        if out.upload_row_id:
             rows.append([InlineKeyboardButton(text="💬 Добавить комментарий",
-                                              callback_data=f"cmt:{upload_row_id}")])
+                                              callback_data=f"cmt:{out.upload_row_id}")])
     keep_dir = False
-    if failed:
+    if out.failed:
         token = uuid.uuid4().hex[:10]
         retry_store[token] = {
-            "items": [items[i] for i, r in enumerate(results) if not r["success"]],
+            "items": [items[i] for i, r in enumerate(out.results) if not r["success"]],
             "work_dir": work_dir, "folder_name": folder_name, "telegram_id": telegram_id,
             "task": asyncio.create_task(_expire_retry(token)),
         }
         keep_dir = True
         rows.append([InlineKeyboardButton(
-            text=f"🔁 Повторить неудачные ({len(failed)})", callback_data=f"retry:{token}")])
+            text=f"🔁 Повторить неудачные ({len(out.failed)})", callback_data=f"retry:{token}")])
     await bot.send_message(chat_id, report, parse_mode="HTML",
                            link_preview_options=LinkPreviewOptions(is_disabled=True),
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
-    # Delete source messages only for files that are on Drive, plainly, so the
-    # report stays the last thing in chat.
-    not_deleted = 0
-    for r in succeeded:
-        try:
-            await bot.delete_message(chat_id, r["message_id"])
-        except Exception as e:
-            logging.warning(f"couldn't delete message {r['message_id']}: {e}")
-            not_deleted += 1
+    # Delete source messages after the report, plainly, so it stays the last thing in chat.
+    not_deleted = await delete_sources(chat_id, out.results)
     if not_deleted:
         await bot.send_message(chat_id, texts.messages_not_deleted(not_deleted), parse_mode="HTML")
 
     if not keep_dir:
         _cleanup()
+
+
+def reconnect_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🔗 Подключить заново", url=build_auth_url(telegram_id))]])

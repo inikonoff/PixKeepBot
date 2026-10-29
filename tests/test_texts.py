@@ -91,3 +91,24 @@ def test_short_link_keeps_folder_id_end():
 def test_plural():
     assert [texts.files(n) for n in (1, 2, 5, 11, 21, 22, 112)] == \
         ["1 файл", "2 файла", "5 файлов", "11 файлов", "21 файл", "22 файла", "112 файлов"]
+
+
+def test_queue_texts():
+    from datetime import datetime, timezone
+    entries = [{"files": [{}, {}]}, {"files": [{}]}]
+    at = datetime(2026, 10, 29, 10, 47, tzinfo=timezone.utc)    # 13:47 Minsk
+    status = texts.queue_status(entries, at, False, False, "14:00", texts.queue_added(2, EVIL))
+    _valid(status)
+    assert "2 пачки, 3 файла" in status and "≈ в 13:47" in status and "до 14:00" in status
+    _valid(texts.queue_status(entries, at, True, False, "14:00"))
+    _valid(texts.queue_status(entries, None, False, True, ""))
+    summary = texts.queue_summary([
+        {"folder_id": "A", "folder_name": EVIL, "link": "https://d/f/A", "uploaded": 3, "duplicates": 1, "unclean": 0},
+        {"folder_id": "A", "folder_name": EVIL, "link": "https://d/f/A", "uploaded": 2, "duplicates": 0, "unclean": 1},
+        {"folder_id": "B", "folder_name": "B", "link": "https://d/f/B", "uploaded": 1, "duplicates": 0, "unclean": 0},
+    ])
+    _valid(summary)
+    assert "3 пачки, 6 файлов" in summary and summary.count("📁") == 2 and "— 5 файлов" in summary
+    for t in (texts.queue_dropped([EVIL], EVIL), texts.queue_no_account(), texts.queue_revoked(),
+              texts.queue_crashed(), texts.queue_added(1, None)):
+        _valid(t)

@@ -21,12 +21,12 @@ from aiogram.types import (
     Message,
 )
 
-from pixkeep import db, texts
+from pixkeep import db, scheduler, texts
 from pixkeep.config import config
 from pixkeep.delivery import deliver, retry_store
 from pixkeep.drive import with_drive
 from pixkeep.drive_utils import list_recent_folders
-from pixkeep.media import MediaRef, pick_folder_date
+from pixkeep.media import BOT_API_DOWNLOAD_LIMIT, MediaRef, pick_folder_date
 from pixkeep.pipeline import prepare_batch
 from pixkeep.runtime import LOCAL_TZ, Flow, bot, get_chat_lock, heartbeat
 
@@ -44,7 +44,7 @@ pending_batch_tasks: dict[int, asyncio.Task] = {}
 # FSM state (waiting_folder_name + its items/work_dir) is per chat, not per
 # batch. If a batch is already waiting for its folder name, a new one is
 # queued here instead of overwriting it, and gets its own question once the
-# one ahead is answered or cancelled. Entries: {"items", "work_dir", "note"}.
+# one ahead is answered or cancelled. Entries: see _ask_or_queue.
 folder_name_queue: dict[int, list[dict]] = {}
 
 
@@ -80,6 +80,9 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     telegram_id = messages[0].from_user.id
     settings = await db.get_settings(telegram_id)
     refs = [r for r in (MediaRef.from_message(m) for m in messages) if r]
+    if settings["deferred"] and db.deferred_available:
+        await _process_deferred(refs, settings, state, chat_id, telegram_id)
+        return
     work_dir = os.path.join(config.TEMP_DIR, str(chat_id), uuid.uuid4().hex)
 
     # TYPING here (vs. UPLOAD_DOCUMENT during the Drive upload) just so the
@@ -99,13 +102,36 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         await deliver(chat_id, telegram_id, batch.items, work_dir, folder_name)
         return
 
-    if await state.get_state() == Flow.waiting_folder_name.state:
-        folder_name_queue.setdefault(chat_id, []).append(
-            {"items": batch.items, "work_dir": work_dir, "note": note})
-        await bot.send_message(chat_id, note + texts.queued_line(), parse_mode="HTML")
-        return
+    await _ask_or_queue(chat_id, state, {"items": batch.items, "work_dir": work_dir, "note": note})
 
-    await _ask_folder_name(chat_id, state, batch.items, work_dir, note)
+
+async def _process_deferred(refs: list[MediaRef], settings: dict, state: FSMContext,
+                            chat_id: int, telegram_id: int) -> None:
+    """Scheduled mode: nothing is downloaded now — the batch's receipts go to
+    the queue (scheduler.py). Files over the Bot API limit are refused right
+    away so their messages don't wait for nothing."""
+    ok = [r for r in refs if not (r.size and r.size > BOT_API_DOWNLOAD_LIMIT)]
+    rejected = [(r.name, "больше 20 МБ — лимит Telegram для ботов") for r in refs if r not in ok]
+    if not ok:
+        await bot.send_message(chat_id, texts.nothing_received(rejected), parse_mode="HTML")
+        return
+    if settings["auto_date_folder"]:
+        if rejected:
+            await bot.send_message(chat_id, texts.skipped_text(rejected), parse_mode="HTML")
+        await scheduler.enqueue(telegram_id, chat_id, ok, None)
+        return
+    await _ask_or_queue(chat_id, state, {"refs": [r.to_dict() for r in ok],
+                                         "note": texts.deferred_intake(ok, rejected)})
+
+
+async def _ask_or_queue(chat_id: int, state: FSMContext, pending: dict) -> None:
+    """pending: {"note", and "items"+"work_dir" (immediate) or "refs" (scheduled)}.
+    One folder question at a time per chat; later batches wait their turn."""
+    if await state.get_state() == Flow.waiting_folder_name.state:
+        folder_name_queue.setdefault(chat_id, []).append(pending)
+        await bot.send_message(chat_id, pending["note"] + texts.queued_line(), parse_mode="HTML")
+        return
+    await _ask_folder_name(chat_id, state, pending)
 
 
 _folders_cache: dict[int, tuple[float, list[str]]] = {}
@@ -125,8 +151,7 @@ async def _recent_folders(account: dict) -> list[str]:
     return names
 
 
-async def _ask_folder_name(chat_id: int, state: FSMContext, items: list[dict],
-                           work_dir: str, note: str) -> None:
+async def _ask_folder_name(chat_id: int, state: FSMContext, pending: dict) -> None:
     """Puts one batch into Flow.waiting_folder_name and sends its prompt with
     quick-pick buttons: today's date + the folders this bot created most
     recently on the active account (private chat: chat_id == user id)."""
@@ -139,13 +164,14 @@ async def _ask_folder_name(chat_id: int, state: FSMContext, items: list[dict],
         logging.exception("folder suggestions failed")
     names = names[:6]
 
-    await state.update_data(items=items, work_dir=work_dir, folder_suggestions=names)
+    await state.update_data(items=pending.get("items"), work_dir=pending.get("work_dir"),
+                            refs=pending.get("refs"), folder_suggestions=names)
     await state.set_state(Flow.waiting_folder_name)
 
     kb_rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"fld:{i}")]
                for i, n in enumerate(names)]
     kb_rows.append([InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")])
-    await bot.send_message(chat_id, note + texts.ask_folder_line(), parse_mode="HTML",
+    await bot.send_message(chat_id, pending["note"] + texts.ask_folder_line(), parse_mode="HTML",
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
@@ -158,7 +184,7 @@ async def _ask_next_queued(chat_id: int, state: FSMContext) -> None:
     nxt = queue.pop(0)
     if not queue:
         folder_name_queue.pop(chat_id, None)
-    await _ask_folder_name(chat_id, state, nxt["items"], nxt["work_dir"], nxt["note"])
+    await _ask_folder_name(chat_id, state, nxt)
 
 
 @router.callback_query(F.data == "cancel")
@@ -197,8 +223,15 @@ async def on_retry(cq: CallbackQuery):
 
 async def _begin_upload(chat_id: int, telegram_id: int, state: FSMContext,
                         data: dict, folder_name: str) -> None:
-    items = data.get("items", [])
+    items = data.get("items") or []
     work_dir = data.get("work_dir")
+    refs = data.get("refs")
+    if refs:
+        await state.clear()
+        async with get_chat_lock(chat_id):
+            await scheduler.enqueue(telegram_id, chat_id, [MediaRef.from_dict(r) for r in refs], folder_name)
+            await _ask_next_queued(chat_id, state)
+        return
     if not items:
         await bot.send_message(chat_id, "Нет файлов для загрузки, начни заново.")
         await state.clear()

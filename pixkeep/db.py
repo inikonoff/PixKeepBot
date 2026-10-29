@@ -40,26 +40,57 @@ DEFAULT_SETTINGS = {
     "replace_duplicates": False,
     "photo_fix": "off",        # off | auto | always   (v5.17)
     "upload_list": False,      # put a txt list of files into the folder (v5.17)
+    # v5.30, migrations/002_deferred_upload.sql
+    "deferred": False,         # upload on a random schedule instead of right away
+    "deferred_min": 10,        # minutes between scheduled uploads: from..
+    "deferred_max": 15,        # ..to
+    "deferred_deadline": "14:00",   # "HH:MM" by which everything is uploaded; "" = none
 }
+DEFERRED_KEYS = ("deferred", "deferred_min", "deferred_max", "deferred_deadline")
+
+# False until check_schema() confirms migration 002 was run. Without it the
+# deferred columns are not selected (defaults apply) and the mode is hidden,
+# so deploying before the migration doesn't break ordinary uploads.
+deferred_available = False
+
+
+def _settings_keys() -> list[str]:
+    return [k for k in DEFAULT_SETTINGS if deferred_available or k not in DEFERRED_KEYS]
+
+
+@_in_thread
+def check_schema() -> list[str]:
+    """Startup check; returns the problems found (empty = all good)."""
+    global deferred_available
+    problems = []
+    probes = [
+        ("user_settings", ", ".join(DEFERRED_KEYS)),
+        ("upload_queue", "id, telegram_id, chat_id, folder_name, files, attempts"),
+        ("upload_queue_state", "telegram_id, chat_id, next_tick_at, flush, paused, status_message_id, summary"),
+    ]
+    for table, columns in probes:
+        try:
+            _sb().table(table).select(columns).limit(1).execute()
+        except Exception as e:
+            problems.append(f"{table}: {str(e)[:150]}")
+    deferred_available = not problems
+    return problems
 
 
 # --------------------------------------------------------------- settings ---
 @_in_thread
 def get_settings(telegram_id: int) -> dict:
-    # Select columns built from DEFAULT_SETTINGS.keys() on purpose — adding a
-    # new setting there automatically includes it here too, so this can't
-    # silently go stale again the way it did with auto_date_folder.
-    columns = ", ".join(DEFAULT_SETTINGS.keys())
+    # Columns come from DEFAULT_SETTINGS on purpose — a new setting added
+    # there is selected automatically and can't silently go stale.
+    keys = _settings_keys()
     resp = (
         _sb().table("user_settings")
-        .select(columns)
+        .select(", ".join(keys))
         .eq("telegram_id", telegram_id)
         .limit(1)
         .execute()
     )
-    if not resp.data:
-        return dict(DEFAULT_SETTINGS)
-    row = resp.data[0]
+    row = resp.data[0] if resp.data else {}
     return {
         key: (row.get(key) if row.get(key) is not None else default)
         for key, default in DEFAULT_SETTINGS.items()
@@ -68,12 +99,71 @@ def get_settings(telegram_id: int) -> dict:
 
 @_in_thread
 def set_setting(telegram_id: int, field: str, value) -> None:
-    if field not in DEFAULT_SETTINGS:
+    if field not in _settings_keys():
         raise ValueError(f"Unknown setting: {field}")
     _sb().table("user_settings").upsert({
         "telegram_id": telegram_id,
         field: value,
     }).execute()
+
+
+# ------------------------------------------------------------ upload queue --
+@_in_thread
+def queue_add(telegram_id: int, chat_id: int, folder_name: str | None,
+              files: list[dict], attempts: int = 0) -> int:
+    resp = _sb().table("upload_queue").insert({
+        "telegram_id": telegram_id, "chat_id": chat_id, "folder_name": folder_name,
+        "files": files, "attempts": attempts,
+    }).execute()
+    return resp.data[0]["id"]
+
+
+@_in_thread
+def queue_list(telegram_id: int) -> list[dict]:
+    """Waiting batches in upload order: retried ones first, then oldest first."""
+    resp = (
+        _sb().table("upload_queue").select("*")
+        .eq("telegram_id", telegram_id)
+        .order("attempts", desc=True).order("id")
+        .execute()
+    )
+    return resp.data or []
+
+
+@_in_thread
+def queue_update(entry_id: int, **fields) -> None:
+    _sb().table("upload_queue").update(fields).eq("id", entry_id).execute()
+
+
+@_in_thread
+def queue_delete(entry_id: int) -> None:
+    _sb().table("upload_queue").delete().eq("id", entry_id).execute()
+
+
+@_in_thread
+def queue_users() -> list[int]:
+    resp = _sb().table("upload_queue").select("telegram_id").execute()
+    return sorted({r["telegram_id"] for r in (resp.data or [])})
+
+
+@_in_thread
+def get_queue_state(telegram_id: int) -> dict | None:
+    resp = (
+        _sb().table("upload_queue_state").select("*")
+        .eq("telegram_id", telegram_id).limit(1).execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+@_in_thread
+def set_queue_state(telegram_id: int, chat_id: int, **fields) -> None:
+    _sb().table("upload_queue_state").upsert(
+        {"telegram_id": telegram_id, "chat_id": chat_id, **fields}).execute()
+
+
+@_in_thread
+def clear_queue_state(telegram_id: int) -> None:
+    _sb().table("upload_queue_state").delete().eq("telegram_id", telegram_id).execute()
 
 
 # ---------------------------------------------------------- Google accounts --
