@@ -52,6 +52,14 @@ DEFERRED_KEYS = ("deferred", "deferred_min", "deferred_max", "deferred_deadline"
 # deferred columns are not selected (defaults apply) and the mode is hidden,
 # so deploying before the migration doesn't break ordinary uploads.
 deferred_available = False
+# Same for migrations/003_parent_folder.sql (parent folder columns).
+parent_available = False
+
+PARENT_COLS = "parent_folder_id, parent_folder_name"
+
+
+def _account_cols() -> str:
+    return "id, email, access_token, refresh_token" + (", " + PARENT_COLS if parent_available else "")
 
 
 def _settings_keys() -> list[str]:
@@ -61,20 +69,23 @@ def _settings_keys() -> list[str]:
 @_in_thread
 def check_schema() -> list[str]:
     """Startup check; returns the problems found (empty = all good)."""
-    global deferred_available
-    problems = []
-    probes = [
-        ("user_settings", ", ".join(DEFERRED_KEYS)),
-        ("upload_queue", "id, telegram_id, chat_id, folder_name, files, attempts"),
-        ("upload_queue_state", "telegram_id, chat_id, next_tick_at, flush, paused, status_message_id, summary"),
-    ]
-    for table, columns in probes:
+    global deferred_available, parent_available
+
+    def probe(table: str, columns: str) -> str | None:
         try:
             _sb().table(table).select(columns).limit(1).execute()
         except Exception as e:
-            problems.append(f"{table}: {str(e)[:150]}")
-    deferred_available = not problems
-    return problems
+            return f"{table}: {str(e)[:150]}"
+        return None
+
+    deferred = [probe("user_settings", ", ".join(DEFERRED_KEYS)),
+                probe("upload_queue", "id, telegram_id, chat_id, folder_name, files, attempts"),
+                probe("upload_queue_state",
+                      "telegram_id, chat_id, next_tick_at, flush, paused, status_message_id, summary")]
+    parent = [probe("google_accounts", PARENT_COLS)]
+    deferred_available = not any(deferred)
+    parent_available = not any(parent)
+    return [p for p in deferred + parent if p]
 
 
 # --------------------------------------------------------------- settings ---
@@ -201,7 +212,7 @@ def list_accounts(telegram_id: int) -> list[dict]:
 def get_active_account(telegram_id: int) -> dict | None:
     resp = (
         _sb().table("google_accounts")
-        .select("id, email, access_token, refresh_token")
+        .select(_account_cols())
         .eq("telegram_id", telegram_id)
         .eq("is_active", True)
         .limit(1)
@@ -229,6 +240,14 @@ def update_account_tokens(account_id: int, access_token: str, refresh_token: str
 
 
 @_in_thread
+def set_parent_folder(telegram_id: int, account_id: int, folder_id: str | None, name: str | None) -> None:
+    """Parent folder of one account (None = no parent: folders go to the Drive root)."""
+    _sb().table("google_accounts").update({
+        "parent_folder_id": folder_id, "parent_folder_name": name,
+    }).eq("id", account_id).eq("telegram_id", telegram_id).execute()
+
+
+@_in_thread
 def remove_all_accounts(telegram_id: int) -> None:
     _sb().table("google_accounts").delete().eq("telegram_id", telegram_id).execute()
     _sb().table("uploads").delete().eq("telegram_id", telegram_id).execute()
@@ -238,7 +257,7 @@ def remove_all_accounts(telegram_id: int) -> None:
 def get_account_by_id(telegram_id: int, account_id: int) -> dict | None:
     resp = (
         _sb().table("google_accounts")
-        .select("id, email, access_token, refresh_token")
+        .select(_account_cols())
         .eq("telegram_id", telegram_id)
         .eq("id", account_id)
         .limit(1)

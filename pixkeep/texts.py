@@ -133,8 +133,9 @@ def auto_folder_line(folder_name: str, from_exif: bool) -> str:
     return f"\n\n📁 Папка <b>{esc(folder_name)}</b> — {source}" + SETTINGS_HINT
 
 
-def ask_folder_line() -> str:
-    return ("\n\n📁 <b>В какую папку?</b> Напиши имя или выбери ниже — "
+def ask_folder_line(parent_name: str | None = None) -> str:
+    inside = f" внутри «{esc(parent_name)}»" if parent_name else ""
+    return (f"\n\n📁 <b>В какую папку{inside}?</b> Напиши имя или выбери ниже — "
             "если такой папки нет, создам." + SETTINGS_HINT)
 
 
@@ -166,12 +167,15 @@ def messages_not_deleted(n: int) -> str:
 
 
 def upload_report(results: list[dict], folder_name: str, link: str, report_entry: dict | None,
-                  list_failed: bool, email: str, quota: tuple | None) -> str:
+                  list_failed: bool, email: str, quota: tuple | None,
+                  parent_name: str | None = None) -> str:
     succeeded = [r for r in results if r["success"]]
     uploaded = [r for r in succeeded if not r.get("duplicate_of")]
     dups = [r for r in succeeded if r.get("duplicate_of")]
     failed = [r for r in results if not r["success"]]
     folder = f"📁 <b>{esc(folder_name.strip())}</b>"
+    if parent_name:
+        folder = f"📁 {esc(parent_name)} / <b>{esc(folder_name.strip())}</b>"
     parts = []
     if uploaded:
         parts.append(f"✅ <b>Загружено: {files(len(uploaded))}</b> в {folder}\n"
@@ -319,3 +323,31 @@ def queue_no_space(email: str, free: int, need: int) -> str:
     return (f"⏸ <b>Очередь на паузе: мало места на Диске</b>\n"
             f"На {esc(email)} свободно {fmt_bytes(free)}, а очередная пачка весит {fmt_bytes(need)}.\n"
             "<i>Освободи место или переключи аккаунт в /accounts, потом нажми «Продолжить очередь».</i>")
+
+
+def parent_missing(name: str, queued: bool = False) -> str:
+    tail = ("Очередь на паузе, файлы никуда не делись: выбери другую папку в /settings → «Родительская папка» "
+            "и нажми «Продолжить очередь».") if queued else (
+            "Выбери другую в /settings → «Родительская папка» и пришли файлы ещё раз.")
+    return f"⚠️ <b>Родительская папка «{esc(name)}» не найдена на Диске</b> (удалена или в корзине).\n{tail}"
+
+
+def parent_label(name: str | None) -> str:
+    return name if name else "корень Диска"
+
+
+def parent_menu(account_email: str, name: str | None, has_folders: bool) -> str:
+    text = (f"📂 <b>Родительская папка</b> · {esc(account_email)}\n"
+            f"Сейчас: <b>{esc(parent_label(name))}</b>\n\n"
+            "Новые папки (по дате или с твоим именем) создаются внутри неё. "
+            "Для каждого Google-аккаунта своя.\n"
+            "<i>Бот видит только папки, которые создал сам, поэтому выбрать можно среди них.</i>")
+    if not has_folders:
+        text += "\n\nПока нет ни одной такой папки — создай новую."
+    return text
+
+
+def parent_set(name: str | None) -> str:
+    if name is None:
+        return "📂 Родительская папка снята — новые папки создаются в корне Диска."
+    return f"📂 Родительская папка: <b>{esc(name)}</b>. Новые папки будут создаваться внутри неё."

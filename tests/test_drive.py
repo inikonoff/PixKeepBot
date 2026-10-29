@@ -1,12 +1,14 @@
 """Drive code against a fake Drive server (aiohttp test server, no Google)."""
 import asyncio
 import json
+import re
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from pixkeep import db, delivery, drive, drive_utils
+from pixkeep.drive_utils import ParentFolderMissing
 
 
 class FakeDrive:
@@ -34,12 +36,15 @@ class FakeDrive:
 
     async def list_files(self, request):
         q = request.query["q"]
+        parent = re.search(r"'([^']+)' in parents", q)
         out = []
         for fid, f in self.files.items():
             if "name='" in q and f"name='{f['name']}'" not in q:
                 continue
-            if "in parents" in q and q.split("'")[1] not in f["parents"]:
-                continue
+            if parent:
+                # "root" = the top level: folders created without a parent
+                if (f["parents"] != [] if parent.group(1) == "root" else parent.group(1) not in f["parents"]):
+                    continue
             if "mimeType='application/vnd.google-apps.folder'" in q and f["mime"] != "folder":
                 continue
             out.append({"id": fid, "name": f["name"], "md5Checksum": f.get("md5")})
@@ -48,8 +53,15 @@ class FakeDrive:
     async def create(self, request):
         meta = await request.json()
         fid = self._new_id()
-        self.files[fid] = {"name": meta["name"], "parents": [], "mime": "folder"}
+        parents = [p for p in meta.get("parents", []) if p != "root"]
+        self.files[fid] = {"name": meta["name"], "parents": parents, "mime": "folder"}
         return web.json_response({"id": fid})
+
+    async def get_file(self, request):
+        f = self.files.get(request.match_info["fid"])
+        if f is None:
+            return web.Response(status=404)
+        return web.json_response({"id": request.match_info["fid"], "trashed": f.get("trashed", False)})
 
     async def upload(self, request):
         import hashlib
@@ -69,6 +81,7 @@ class FakeDrive:
         app = web.Application(middlewares=[self.mw])
         app.router.add_get("/drive/v3/files", self.list_files)
         app.router.add_post("/drive/v3/files", self.create)
+        app.router.add_get("/drive/v3/files/{fid}", self.get_file)
         app.router.add_post("/upload/drive/v3/files", self.upload)
         app.router.add_post("/drive/v3/files/{fid}/permissions", self.permissions)
         return app
@@ -166,3 +179,44 @@ def test_upload_failure_is_reported_not_raised(tmp_path, monkeypatch, no_backoff
     results, _, _ = asyncio.run(_with_server(
         fake, monkeypatch, lambda: delivery.upload_all(_account("good"), items, "T")))
     assert not results[0]["success"] and "boom" in results[0]["error"]
+
+
+def test_folders_go_inside_the_parent_folder(tmp_path, monkeypatch, no_backoff):
+    fake = FakeDrive()
+    items = _items(tmp_path, b"x")
+
+    async def go():
+        async with drive.DriveClient(_account("good")) as d:
+            parent_id = await d.call(lambda s, t: drive_utils.ensure_folder(s, t, "Photos", "root"))
+            decoy = await d.call(lambda s, t: drive_utils.ensure_folder(s, t, "28.10.26", "root"))
+        account = {**_account("good"), "parent_folder_id": parent_id, "parent_folder_name": "Photos"}
+        first = await delivery.upload_all(account, items, "28.10.26")
+        second = await delivery.upload_all(account, items, "28.10.26")
+        async with drive.DriveClient(_account("good")) as d:
+            tops = await d.call(lambda s, t: drive_utils.list_folders(s, t, 10, root_only=True))
+            inside = await d.call(lambda s, t: drive_utils.list_recent_folders(s, t, 6, parent_id))
+        return parent_id, decoy, first, second, tops, inside
+
+    parent_id, decoy, (_, _, f1), (_, _, f2), tops, inside = asyncio.run(_with_server(fake, monkeypatch, go))
+    assert f1 == f2 and f1 != decoy                      # same folder reused, root decoy ignored
+    assert fake.files[f1]["parents"] == [parent_id]
+    assert sorted(f["name"] for f in tops) == ["28.10.26", "Photos"]   # nested folder isn't a candidate
+    assert inside == ["28.10.26"]
+
+
+def test_missing_parent_folder_is_reported(tmp_path, monkeypatch, no_backoff):
+    fake = FakeDrive()
+    items = _items(tmp_path, b"x")
+    account = {**_account("good"), "parent_folder_id": "gone", "parent_folder_name": "Old"}
+    with pytest.raises(ParentFolderMissing, match="Old"):
+        asyncio.run(_with_server(fake, monkeypatch, lambda: delivery.upload_all(account, items, "T")))
+    assert not [f for f in fake.files.values() if f["mime"] == "file"]
+
+
+def test_trashed_parent_folder_is_reported(tmp_path, monkeypatch, no_backoff):
+    fake = FakeDrive()
+    fake.files["p1"] = {"name": "P", "parents": [], "mime": "folder", "trashed": True}
+    account = {**_account("good"), "parent_folder_id": "p1", "parent_folder_name": "P"}
+    with pytest.raises(ParentFolderMissing):
+        asyncio.run(_with_server(fake, monkeypatch, lambda: delivery.upload_all(
+            account, _items(tmp_path, b"x"), "T")))
