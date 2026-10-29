@@ -78,6 +78,16 @@ def test_other_messages():
         _valid(t)
 
 
+def test_short_link_keeps_folder_id_end():
+    link = "https://drive.google.com/drive/folders/1DYni1DJ-T7-p1C711jY3lLcpEixm6gmL"
+    short = "drive.google.com/…/…lLcpEixm6gmL"
+    assert texts.short_link(link) == short
+    text = texts.upload_report([{"upload_name": "a.jpg", "orig_name": "a.jpg", "success": True}],
+                               "28.10.26", link, None, False, "e", None)
+    assert f'<a href="{link}">{short}</a>' in text
+    assert texts.short_link("https://x.io/a") == "x.io/a"
+
+
 def test_plural():
     assert [texts.files(n) for n in (1, 2, 5, 11, 21, 22, 112)] == \
         ["1 файл", "2 файла", "5 файлов", "11 файлов", "21 файл", "22 файла", "112 файлов"]
