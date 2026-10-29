@@ -66,6 +66,18 @@ def name_list(names: list[str]) -> str:
     return f"<{tag}>" + "\n".join(shown) + "</blockquote>"
 
 
+def short_link(link: str, tail: int = 12) -> str:
+    """https://drive.google.com/drive/folders/1DYni1DJ-T7-p1C711jY3lLcpEixm6gmL ->
+    "drive.google.com/…/…lLcpEixm6gmL": short, but the end of the folder id stays
+    visible, so a glance tells whether uploads keep going into the same folder."""
+    rest = link.split("://", 1)[-1]
+    host, _, path = rest.partition("/")
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if not path or len(rest) <= len(host) + tail + 4:
+        return rest
+    return f"{host}/…/…{last[-tail:]}" if len(last) > tail else f"{host}/…/{last}"
+
+
 def skipped_text(skipped: list[tuple[str, str]]) -> str:
     lines = [f"🚫 <b>Не принято: {files(len(skipped))}</b>"]
     lines += [f"• {esc(name)} — {esc(reason)}" for name, reason in skipped[:10]]
@@ -178,7 +190,8 @@ def upload_report(results: list[dict], folder_name: str, link: str, report_entry
     elif list_failed:
         extra.append("⚠️ txt-список загрузить не удалось (файлы при этом загружены).")
     if succeeded:
-        extra.append(f'🔗 <a href="{esc(link, quote=True)}">Открыть папку</a> · доступ по ссылке')
+        extra.append(f'🔗 <a href="{esc(link, quote=True)}">{esc(short_link(link))}</a>\n'
+                     "<i>доступ на чтение по ссылке</i>")
         if quota:
             extra.append(f"💾 {esc(email)} · {quota_label(quota)}")
     if extra:
