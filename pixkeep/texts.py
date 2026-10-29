@@ -229,3 +229,87 @@ def build_list_text(folder_name: str, results: list[dict], s: dict, now: datetim
             line = f"{r['orig_name']} - FAILED"
         lines.append(line)
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------- deferred mode ---
+def batches(n: int) -> str:
+    return plural(n, "пачка", "пачки", "пачек")
+
+
+def _hm(dt: datetime) -> str:
+    return dt.astimezone(LOCAL_TZ).strftime("%H:%M")
+
+
+def deferred_intake(refs: list, rejected: list[tuple[str, str]]) -> str:
+    """Note for a batch going into the queue (files are not downloaded yet)."""
+    parts = [f"🕒 <b>В очередь: {files(len(refs))}</b>"]
+    compressed = sum(1 for r in refs if r.kind == "photo")
+    if compressed:
+        parts.append(f"📷 Как «Фото» пришло: {compressed} — Telegram их сжал. "
+                     "Оригиналы присылай файлом (📎 → Файл).")
+    if rejected:
+        parts.append(skipped_text(rejected))
+    return "\n\n".join(parts)
+
+
+def queue_added(n: int, folder_name: str | None) -> str:
+    where = f"📁 <b>{esc(folder_name)}</b>" if folder_name else "📁 папка по дате съёмки"
+    return f"➕ Добавлено: {files(n)} → {where}"
+
+
+def queue_status(entries: list[dict], next_at: datetime | None, flush: bool, paused: bool,
+                 deadline: str | None, added: str | None = None) -> str:
+    n_files = sum(len(e["files"]) for e in entries)
+    lines = []
+    if added:
+        lines += [added, ""]
+    lines.append(f"🕒 <b>Очередь загрузки</b> · {batches(len(entries))}, {files(n_files)}")
+    if paused:
+        lines.append("⏸ На паузе — см. сообщение выше")
+    elif next_at and flush:
+        lines.append(f"В {_hm(next_at)} загружу всё, что останется")
+    elif next_at:
+        lines.append(f"Следующая пачка ≈ в {_hm(next_at)}")
+        if deadline:
+            lines.append(f"<i>Всё уйдёт до {esc(deadline)}</i>")
+    return "\n".join(lines)
+
+
+def queue_summary(summary: list[dict]) -> str:
+    """Final report once the queue is empty: per folder, in upload order."""
+    by_folder: dict[str, dict] = {}
+    for s in summary:
+        f = by_folder.setdefault(s["folder_id"], {**s, "uploaded": 0, "duplicates": 0, "unclean": 0})
+        for k in ("uploaded", "duplicates", "unclean"):
+            f[k] += s[k]
+        f["folder_name"], f["link"] = s["folder_name"], s["link"]
+    total = sum(f["uploaded"] for f in by_folder.values())
+    parts = [f"✅ <b>Очередь загружена</b> · {batches(len(summary))}, {files(total)}"]
+    for f in by_folder.values():
+        line = f"📁 <b>{esc(f['folder_name'])}</b> — {files(f['uploaded'])}"
+        if f["duplicates"]:
+            line += f", дубликатов пропущено: {f['duplicates']}"
+        line += f'\n🔗 <a href="{esc(f["link"], quote=True)}">{esc(short_link(f["link"]))}</a>'
+        if f["unclean"]:
+            line += f"\n⚠️ Метаданные не удалось почистить: {files(f['unclean'])}"
+        parts.append(line)
+    return "\n\n".join(parts)
+
+
+def queue_dropped(names: list[str], reason: str) -> str:
+    return ("❌ <b>Не загрузилось после трёх попыток: " + files(len(names)) + "</b>\n"
+            + name_list(names) + f"\n<i>{esc(reason[:300])}</i>\nИх сообщения остались в чате.")
+
+
+def queue_no_account() -> str:
+    return "⏸ <b>Очередь на паузе</b>: нет активного Google-аккаунта. Подключи его в /start или выбери в /accounts."
+
+
+def queue_revoked() -> str:
+    return ("⏸ <b>Очередь на паузе</b>: Google отозвал доступ к аккаунту. "
+            "Подключи его заново и нажми «Продолжить очередь» — файлы никуда не делись.")
+
+
+def queue_crashed() -> str:
+    return ("⚠️ <b>Расписание загрузки остановилось из-за ошибки.</b> Файлы остаются в очереди — "
+            "нажми «⏩ Загрузить всё сейчас» под статусом очереди или пришли новую пачку.")

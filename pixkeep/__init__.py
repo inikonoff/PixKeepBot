@@ -1,2 +1,2 @@
 """PixKeep Bot package. Entry point: main.py in the repository root."""
-VERSION = "5.29"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.30"  # bump on every change; check via /version to confirm what's actually deployed

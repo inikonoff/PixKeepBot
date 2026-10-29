@@ -23,6 +23,7 @@ class Flow(StatesGroup):
     waiting_folder_name = State()
     waiting_comment = State()
     waiting_rename = State()
+    waiting_deadline = State()
 
 
 # Serializes batch processing per chat. Without it two batches for the same
