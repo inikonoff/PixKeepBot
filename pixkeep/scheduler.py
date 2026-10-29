@@ -31,6 +31,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 from pixkeep import db, texts
 from pixkeep.config import config
 from pixkeep.delivery import delete_sources, reconnect_keyboard, upload_and_record
+from pixkeep.drive import account_quota
 from pixkeep.media import MediaRef, pick_folder_date
 from pixkeep.oauth import TokenRevokedError
 from pixkeep.pipeline import prepare_batch
@@ -181,7 +182,13 @@ async def _tick(telegram_id: int, chat_id: int, entries: list[dict], flush: bool
     if not account:
         await _pause(telegram_id, chat_id, texts.queue_no_account())
         return
-    for entry in entries if flush else entries[:1]:
+    todo = entries if flush else entries[:1]
+    need = sum(f.get("size") or 0 for e in todo for f in e["files"])
+    q = await account_quota(account, fresh=True)
+    if q and q[1] and q[0] + need > q[1]:
+        await _pause(telegram_id, chat_id, texts.queue_no_space(account["email"], max(q[1] - q[0], 0), need))
+        return
+    for entry in todo:
         try:
             await _process_entry(telegram_id, chat_id, account, entry)
         except TokenRevokedError:

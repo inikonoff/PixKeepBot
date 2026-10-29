@@ -236,6 +236,14 @@ async def _begin_upload(chat_id: int, telegram_id: int, state: FSMContext,
         await bot.send_message(chat_id, "Нет файлов для загрузки, начни заново.")
         await state.clear()
         return
+    if not (work_dir and os.path.isdir(work_dir)):
+        # swept by housekeeping after hours of waiting, or the bot restarted
+        await state.clear()
+        await bot.send_message(chat_id, "⌛ Пачка ждала имя папки слишком долго, и её временные файлы "
+                                        "удалены. Пришли эти файлы ещё раз — их сообщения остались в чате.")
+        async with get_chat_lock(chat_id):
+            await _ask_next_queued(chat_id, state)
+        return
     await state.clear()
     # Same per-chat lock as _process: a queued batch can't be asked out of
     # turn, and this upload's ensure_folder() can't race a new batch's.

@@ -141,6 +141,13 @@ def world(monkeypatch):
     async def delete_sources(chat_id, results):
         return 0
 
+    quota = {"value": (0, None)}
+
+    async def account_quota(account, fresh=False):
+        return quota["value"]
+
+    monkeypatch.setattr(scheduler, "account_quota", account_quota)
+    fail["quota"] = quota
     monkeypatch.setattr(scheduler, "prepare_batch", prepare)
     monkeypatch.setattr(scheduler, "upload_and_record", upload)
     monkeypatch.setattr(scheduler, "delete_sources", delete_sources)
@@ -240,3 +247,16 @@ def test_restart_resumes_stored_queue(world):
 
     asyncio.run(go())
     assert uploads == [("Old", ["1.jpg", "2.jpg"])]
+
+
+def test_not_enough_drive_space_pauses_before_download(world):
+    store, bot, uploads, fail = world
+    fail["quota"]["value"] = (999, 1000)          # 1 byte free, batch needs 2
+
+    async def go():
+        await scheduler.enqueue(1, 1, _refs(1, 2), "T")
+        await _drain()
+
+    asyncio.run(go())
+    assert uploads == [] and store.state[1]["paused"] and len(store.queue) == 1
+    assert any("мало места на Диске" in t for t in bot.sent)

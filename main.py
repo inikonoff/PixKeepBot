@@ -24,6 +24,7 @@ from aiogram.types import BotCommand
 from pixkeep import db, scheduler
 from pixkeep.config import config
 from pixkeep.handlers import routers
+from pixkeep.housekeeping import housekeeping_loop
 from pixkeep.runtime import bot
 from pixkeep.web import run_web
 
@@ -96,6 +97,7 @@ async def main():
     await _check_schema()
     await run_web()
     keepalive_task = asyncio.create_task(db.keep_alive_loop())
+    housekeeping_task = asyncio.create_task(housekeeping_loop())
     if db.deferred_available:
         try:
             await scheduler.resume_all()   # continue queues left by the previous run
@@ -105,7 +107,8 @@ async def main():
         await dp.start_polling(bot)
     finally:
         keepalive_task.cancel()
-        await asyncio.gather(keepalive_task, return_exceptions=True)
+        housekeeping_task.cancel()
+        await asyncio.gather(keepalive_task, housekeeping_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -80,3 +80,10 @@ def test_folder_question_then_enqueue(calls):
 
     asyncio.run(go())
     assert calls["enqueued"] == [(["1.jpg", "2.jpg"], "Trip")] and state.state is None
+
+
+def test_answer_after_temp_files_were_swept(calls, tmp_path):
+    state = State()
+    data = {"items": [{"message_id": 1}], "work_dir": str(tmp_path / "gone")}
+    asyncio.run(intake._begin_upload(1, 1, state, data, "Trip"))
+    assert "слишком долго" in calls["sent"][-1] and state.state is None
