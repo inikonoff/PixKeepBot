@@ -62,8 +62,9 @@ BOT_COMMANDS = [
 
 
 async def _check_schema() -> None:
-    """Scheduled upload needs migrations/002_deferred_upload.sql. Without it
-    the bot still runs (that mode is just unavailable) and tells the admins."""
+    """Some features need SQL from migrations/ (002: scheduled upload, 003:
+    parent folder). Without it the bot still runs, those features are just
+    unavailable, and the admins are told which file to run."""
     try:
         problems = await db.check_schema()
     except Exception:
@@ -71,13 +72,17 @@ async def _check_schema() -> None:
         return
     if not problems:
         return
-    logging.warning("schema incomplete, scheduled upload disabled: %s", problems)
+    logging.warning("schema incomplete, some features disabled: %s", problems)
+    missing = []
+    if not db.deferred_available:
+        missing.append("• загрузка по расписанию — migrations/002_deferred_upload.sql")
+    if not db.parent_available:
+        missing.append("• родительская папка — migrations/003_parent_folder.sql")
+    text = ("⚠️ В базе не хватает таблиц или колонок, поэтому выключено:\n" + "\n".join(missing)
+            + "\n\nОстальное работает. Выполни файлы в Supabase SQL Editor и перезапусти бота.")
     for admin in config.ADMIN_IDS:
         with contextlib.suppress(Exception):
-            await bot.send_message(
-                admin, "⚠️ В базе нет таблиц для загрузки по расписанию — этот режим выключен, "
-                       "остальное работает. Выполни в Supabase SQL Editor файл "
-                       "migrations/002_deferred_upload.sql и перезапусти бота.")
+            await bot.send_message(admin, text)
 
 
 async def main():

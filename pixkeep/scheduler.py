@@ -32,6 +32,7 @@ from pixkeep import db, texts
 from pixkeep.config import config
 from pixkeep.delivery import delete_sources, reconnect_keyboard, upload_and_record
 from pixkeep.drive import account_quota
+from pixkeep.drive_utils import ParentFolderMissing
 from pixkeep.media import MediaRef, pick_folder_date
 from pixkeep.oauth import TokenRevokedError
 from pixkeep.pipeline import prepare_batch
@@ -193,6 +194,9 @@ async def _tick(telegram_id: int, chat_id: int, entries: list[dict], flush: bool
             await _process_entry(telegram_id, chat_id, account, entry)
         except TokenRevokedError:
             await _pause(telegram_id, chat_id, texts.queue_revoked(), reconnect=True)
+            return
+        except ParentFolderMissing as e:
+            await _pause(telegram_id, chat_id, texts.parent_missing(str(e), queued=True))
             return
         except Exception as e:
             logging.exception("scheduled batch failed")

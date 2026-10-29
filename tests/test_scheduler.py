@@ -8,6 +8,7 @@ import pytest
 
 from pixkeep import db, scheduler
 from pixkeep.delivery import Outcome
+from pixkeep.drive_utils import ParentFolderMissing
 from pixkeep.media import MediaRef
 from pixkeep.oauth import TokenRevokedError
 from pixkeep.pipeline import PreparedBatch
@@ -133,6 +134,8 @@ def world(monkeypatch):
     async def upload(account, tid, items, folder, work_dir, on_progress=None):
         if fail["revoked"]:
             raise TokenRevokedError("revoked")
+        if fail.get("parent"):
+            raise ParentFolderMissing("Photos")
         uploads.append((folder, [it["upload_name"] for it in items]))
         results = [{**it, "success": it["upload_name"] not in fail["names"]} for it in items]
         return Outcome(results=results, link=f"https://drive.google.com/drive/folders/F{folder}",
@@ -260,3 +263,16 @@ def test_not_enough_drive_space_pauses_before_download(world):
     asyncio.run(go())
     assert uploads == [] and store.state[1]["paused"] and len(store.queue) == 1
     assert any("мало места на Диске" in t for t in bot.sent)
+
+
+def test_missing_parent_folder_pauses_the_queue(world):
+    store, bot, uploads, fail = world
+    fail["parent"] = True
+
+    async def go():
+        await scheduler.enqueue(1, 1, _refs(1, 1), "T")
+        await _drain()
+
+    asyncio.run(go())
+    assert store.state[1]["paused"] and len(store.queue) == 1 and store.queue[0]["attempts"] == 0
+    assert any("«Photos» не найдена" in t for t in bot.sent)

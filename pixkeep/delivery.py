@@ -20,8 +20,10 @@ from pixkeep import db, texts
 from pixkeep.config import config
 from pixkeep.drive import TXT_MIME, DriveClient, account_quota, with_drive
 from pixkeep.drive_utils import (
+    ParentFolderMissing,
     ensure_folder,
     find_file_in_folder,
+    folder_alive,
     list_folder_md5,
     publish_and_get_url,
     replace_file_content,
@@ -81,7 +83,10 @@ async def upload_all(account: dict, items: list[dict], folder_name: str,
     results: list[dict | None] = [None] * len(items)
 
     async with DriveClient(account) as drive:
-        folder_id = await drive.call(lambda s, t: ensure_folder(s, t, folder_name))
+        parent_id = account.get("parent_folder_id")
+        if parent_id and not await drive.call(lambda s, t: folder_alive(s, t, parent_id)):
+            raise ParentFolderMissing(account.get("parent_folder_name") or parent_id)
+        folder_id = await drive.call(lambda s, t: ensure_folder(s, t, folder_name, parent_id))
 
         try:
             known, names_in_folder = await drive.call(lambda s, t: list_folder_md5(s, t, folder_id))
@@ -300,6 +305,11 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
         )
         _cleanup()
         return
+    except ParentFolderMissing as e:
+        await _drop_status()
+        await bot.send_message(chat_id, texts.parent_missing(str(e)), parse_mode="HTML")
+        _cleanup()
+        return
     except Exception as e:
         logging.exception("upload failed")
         await _drop_status()
@@ -309,7 +319,7 @@ async def deliver(chat_id: int, telegram_id: int, items: list[dict],
     await _drop_status()
 
     report = texts.upload_report(out.results, folder_name, out.link, out.report_entry,
-                                 out.list_failed, out.email, out.quota)
+                                 out.list_failed, out.email, out.quota, account.get("parent_folder_name"))
     rows = []
     if out.succeeded:
         rows.append([InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=out.link))])

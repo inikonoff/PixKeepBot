@@ -85,9 +85,25 @@ async def _check(resp: aiohttp.ClientResponse, ok=(200, 201)):
     raise RuntimeError(f"Google API {resp.status}: {text}")
 
 
+class ParentFolderMissing(Exception):
+    """The chosen parent folder was deleted (or trashed) on Drive."""
+
+
+async def folder_alive(session: aiohttp.ClientSession, token: str, folder_id: str) -> bool:
+    """True if the folder exists and isn't in the trash."""
+    async with session.get(
+        f"{API}/files/{folder_id}", params={"fields": "id,trashed"}, headers=_headers(token),
+    ) as resp:
+        if resp.status == 404:
+            return False
+        await _check(resp, ok=(200,))
+        return not (await resp.json()).get("trashed")
+
+
 async def ensure_folder(session: aiohttp.ClientSession, token: str,
-                        folder_name: str) -> str:
-    """Find or create a folder by name in the app's visible root, return its id.
+                        folder_name: str, parent_id: str | None = None) -> str:
+    """Find or create a folder by name, return its id. With parent_id it is
+    searched for and created inside that folder; without — anywhere visible.
 
     Note: with drive.file scope, the app can only see files/folders IT
     created (or that the user explicitly opened with it) — so this search
@@ -98,6 +114,8 @@ async def ensure_folder(session: aiohttp.ClientSession, token: str,
         f"mimeType='application/vnd.google-apps.folder' and name='{safe_name}' "
         "and trashed=false"
     )
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
     async with session.get(
         f"{API}/files", params={"q": query, "fields": "files(id,name)"},
         headers=_headers(token),
@@ -110,6 +128,8 @@ async def ensure_folder(session: aiohttp.ClientSession, token: str,
         return files[0]["id"]
 
     metadata = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        metadata["parents"] = [parent_id]
     async with session.post(
         f"{API}/files", json=metadata, headers=_headers(token),
     ) as resp:
@@ -289,21 +309,32 @@ async def list_folder_md5(session: aiohttp.ClientSession, token: str,
             return out, by_name
 
 
-async def list_recent_folders(session: aiohttp.ClientSession, token: str,
-                              limit: int = 6) -> list[str]:
-    """Names of the folders this app created, most recently modified first."""
+async def list_folders(session: aiohttp.ClientSession, token: str, limit: int = 6,
+                       parent_id: str | None = None, root_only: bool = False) -> list[dict]:
+    """[{"id", "name"}] of the folders this app created, most recently modified
+    first. parent_id: only those inside it; root_only: only those at the top
+    level of the Drive (candidates for a parent folder)."""
+    query = "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    elif root_only:
+        query += " and 'root' in parents"
     async with session.get(
         f"{API}/files",
-        params={
-            "q": "mimeType='application/vnd.google-apps.folder' and trashed=false",
-            "orderBy": "modifiedTime desc", "pageSize": limit,
-            "fields": "files(name)",
-        },
+        params={"q": query, "orderBy": "modifiedTime desc", "pageSize": limit,
+                "fields": "files(id,name)"},
         headers=_headers(token),
     ) as resp:
         await _check(resp, ok=(200,))
         data = await resp.json()
-    return [f["name"] for f in data.get("files", [])]
+    return data.get("files", [])
+
+
+async def list_recent_folders(session: aiohttp.ClientSession, token: str,
+                              limit: int = 6, parent_id: str | None = None) -> list[str]:
+    """Names of the folders this app created (inside parent_id, if given),
+    most recently modified first."""
+    return [f["name"] for f in await list_folders(session, token, limit, parent_id)]
 
 
 async def rename_file(session: aiohttp.ClientSession, token: str,

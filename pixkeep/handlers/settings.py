@@ -11,7 +11,9 @@ from aiogram.types import (
     Message,
 )
 
-from pixkeep import db
+from pixkeep import db, texts
+from pixkeep.drive import with_drive
+from pixkeep.drive_utils import ensure_folder, get_file_meta, list_folders
 from pixkeep.runtime import Flow
 from pixkeep.scheduler import DEADLINE_PRESETS, INTERVAL_PRESETS, parse_hhmm
 
@@ -26,14 +28,20 @@ PHOTO_FIX_LABELS = {
 }
 
 
-def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
+def _settings_keyboard(s: dict, account: dict | None = None) -> InlineKeyboardMarkup:
     clean_mark = "✅" if s["clean_metadata"] else "⬜"
     rename_mark = "✅" if s["anonymize_names"] else "⬜"
     date_mark = "✅" if s["auto_date_folder"] else "⬜"
     replace_mark = "✅" if s["replace_duplicates"] else "⬜"
     list_mark = "✅" if s["upload_list"] else "⬜"
     fix_label = PHOTO_FIX_LABELS.get(s["photo_fix"], PHOTO_FIX_LABELS["off"])
-    return InlineKeyboardMarkup(inline_keyboard=[
+    parent_row = []
+    if db.parent_available and account:
+        parent_row = [[InlineKeyboardButton(
+            text=f"📂 Родительская папка: {texts.parent_label(account.get('parent_folder_name'))}"[:60],
+            callback_data="par",
+        )]]
+    return InlineKeyboardMarkup(inline_keyboard=parent_row + [
         [InlineKeyboardButton(
             text=f"{clean_mark} Чистить метаданные (EXIF/GPS)",
             callback_data="toggle:clean_metadata",
@@ -108,13 +116,17 @@ def _deferred_keyboard(s: dict) -> InlineKeyboardMarkup:
     ])
 
 
+async def _settings_markup(uid: int, s: dict) -> InlineKeyboardMarkup:
+    return _settings_keyboard(s, await db.get_active_account(uid))
+
+
 @router.message(Command("settings"))
 async def settings_cmd(message: Message):
     if not await db.get_active_account(message.from_user.id):
         await message.answer("Сначала подключи Google Drive командой /start.")
         return
     s = await db.get_settings(message.from_user.id)
-    await message.answer(SETTINGS_TEXT, reply_markup=_settings_keyboard(s))
+    await message.answer(SETTINGS_TEXT, reply_markup=await _settings_markup(message.from_user.id, s))
 
 
 @router.callback_query(F.data.startswith("toggle:"))
@@ -130,7 +142,7 @@ async def on_toggle_setting(cq: CallbackQuery):
     new_value = not s[field]
     await db.set_setting(cq.from_user.id, field, new_value)
     s[field] = new_value
-    await cq.message.edit_reply_markup(reply_markup=_settings_keyboard(s))
+    await cq.message.edit_reply_markup(reply_markup=await _settings_markup(cq.from_user.id, s))
     await cq.answer("Обновлено")
 
 
@@ -141,7 +153,7 @@ async def on_cycle_photo_fix(cq: CallbackQuery):
     new_value = PHOTO_FIX_ORDER[(PHOTO_FIX_ORDER.index(cur) + 1) % len(PHOTO_FIX_ORDER)]
     await db.set_setting(cq.from_user.id, "photo_fix", new_value)
     s["photo_fix"] = new_value
-    await cq.message.edit_reply_markup(reply_markup=_settings_keyboard(s))
+    await cq.message.edit_reply_markup(reply_markup=await _settings_markup(cq.from_user.id, s))
     await cq.answer(PHOTO_FIX_LABELS[new_value])
 
 
@@ -157,7 +169,7 @@ async def on_deferred(cq: CallbackQuery, state: FSMContext):
     parts = cq.data.split(":")
     if parts == ["dfr", "back"]:
         s = await db.get_settings(uid)
-        await cq.message.edit_text(SETTINGS_TEXT, reply_markup=_settings_keyboard(s))
+        await cq.message.edit_text(SETTINGS_TEXT, reply_markup=await _settings_markup(uid, s))
         await cq.answer()
         return
     if parts == ["dfr", "dc"]:
@@ -195,3 +207,98 @@ async def on_deadline_text(message: Message, state: FSMContext):
     s = await db.get_settings(message.from_user.id)
     await message.answer(f"🕒 Крайний срок: {value}.\n\n" + DEFERRED_TEXT, parse_mode="HTML",
                          reply_markup=_deferred_keyboard(s))
+
+
+# --------------------------------------------------------- parent folder ----
+PARENT_FOLDERS_SHOWN = 8
+
+
+async def _parent_view(account: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Menu of the parent folder of the active account: folders the bot created
+    at the top level of that Drive (the only ones it can see), create / clear."""
+    folders = await with_drive(account, lambda s, t: list_folders(s, t, PARENT_FOLDERS_SHOWN, root_only=True))
+    cur = account.get("parent_folder_id")
+    rows = [[InlineKeyboardButton(text=("✓ " if f["id"] == cur else "📁 ") + f["name"][:50],
+                                  callback_data=f"par:s:{f['id']}")] for f in folders]
+    rows.append([InlineKeyboardButton(text="➕ Создать новую папку…", callback_data="par:new")])
+    if cur:
+        rows.append([InlineKeyboardButton(text="🏠 Без родительской папки (корень)", callback_data="par:none")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="par:back")])
+    text = texts.parent_menu(account["email"], account.get("parent_folder_name"), bool(folders))
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("par"))
+async def on_parent(cq: CallbackQuery, state: FSMContext):
+    uid = cq.from_user.id
+    if not db.parent_available:
+        await cq.answer("Сначала выполни в Supabase SQL из migrations/003_parent_folder.sql "
+                        "и перезапусти бота.", show_alert=True)
+        return
+    account = await db.get_active_account(uid)
+    if not account:
+        await cq.answer("Сначала подключи Google Drive командой /start.", show_alert=True)
+        return
+    parts = cq.data.split(":", 2)
+    try:
+        if parts == ["par", "back"]:
+            s = await db.get_settings(uid)
+            await cq.message.edit_text(SETTINGS_TEXT, reply_markup=_settings_keyboard(s, account))
+            await cq.answer()
+            return
+        if parts == ["par", "new"]:
+            cur = await state.get_state()
+            if cur != Flow.waiting_parent_name.state:
+                await state.update_data(parent_prev_state=cur)
+            await state.set_state(Flow.waiting_parent_name)
+            await cq.message.answer(
+                "✏️ Напиши имя новой родительской папки — создам её в корне Диска и "
+                "сделаю родительской.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="par:x")]]))
+            await cq.answer()
+            return
+        if parts == ["par", "x"]:
+            data = await state.get_data()
+            if await state.get_state() == Flow.waiting_parent_name.state:
+                await state.set_state(data.get("parent_prev_state"))
+            await cq.message.edit_text("❌ Отменено.")
+            await cq.answer()
+            return
+        note = None
+        if parts == ["par", "none"]:
+            await db.set_parent_folder(uid, account["id"], None, None)
+            note = "Родительская папка снята"
+        elif len(parts) == 3 and parts[1] == "s":
+            meta = await with_drive(account, lambda s, t: get_file_meta(s, t, parts[2]))
+            await db.set_parent_folder(uid, account["id"], parts[2], meta["name"])
+            note = f"Родительская папка: {meta['name']}"[:190]
+        if note:
+            account = await db.get_active_account(uid)
+        text, kb = await _parent_view(account)
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await cq.answer(note)
+    except Exception as e:
+        await cq.answer(f"Ошибка: {e}"[:190], show_alert=True)
+
+
+@router.message(Flow.waiting_parent_name, F.text, ~F.text.startswith("/"))
+async def on_parent_name(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    name = message.text.strip()
+    if not name or len(name) > 100:
+        await message.answer("Имя должно быть от 1 до 100 символов. Напиши ещё раз или нажми «Отмена».")
+        return
+    account = await db.get_active_account(uid)
+    if not account:
+        await message.answer("Сначала подключи Google Drive командой /start.")
+        return
+    data = await state.get_data()
+    try:
+        folder_id = await with_drive(account, lambda s, t: ensure_folder(s, t, name, "root"))
+        await db.set_parent_folder(uid, account["id"], folder_id, name)
+    except Exception as e:
+        await message.answer(f"Не удалось создать папку: {e}")
+        return
+    await state.set_state(data.get("parent_prev_state"))
+    await message.answer(texts.parent_set(name), parse_mode="HTML")

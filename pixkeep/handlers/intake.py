@@ -134,20 +134,21 @@ async def _ask_or_queue(chat_id: int, state: FSMContext, pending: dict) -> None:
     await _ask_folder_name(chat_id, state, pending)
 
 
-_folders_cache: dict[int, tuple[float, list[str]]] = {}
+_folders_cache: dict[tuple, tuple[float, list[str]]] = {}
 
 
 async def _recent_folders(account: dict) -> list[str]:
-    hit = _folders_cache.get(account["id"])
+    key = (account["id"], account.get("parent_folder_id"))
+    hit = _folders_cache.get(key)
     if hit and time.monotonic() - hit[0] < 30:
         return hit[1]
     try:
         names = await asyncio.wait_for(
-            with_drive(account, lambda s, t: list_recent_folders(s, t, 6)), 6)
+            with_drive(account, lambda s, t: list_recent_folders(s, t, 6, account.get("parent_folder_id"))), 6)
     except Exception as e:
         logging.warning(f"recent folders fetch failed: {e}")
         return []
-    _folders_cache[account["id"]] = (time.monotonic(), names)
+    _folders_cache[key] = (time.monotonic(), names)
     return names
 
 
@@ -156,9 +157,11 @@ async def _ask_folder_name(chat_id: int, state: FSMContext, pending: dict) -> No
     quick-pick buttons: today's date + the folders this bot created most
     recently on the active account (private chat: chat_id == user id)."""
     names = [datetime.now(LOCAL_TZ).strftime("%d.%m.%y")]
+    parent_name = None
     try:
         account = await db.get_active_account(chat_id)
         if account:
+            parent_name = account.get("parent_folder_name")
             names += [n for n in await _recent_folders(account) if n not in names]
     except Exception:
         logging.exception("folder suggestions failed")
@@ -171,7 +174,7 @@ async def _ask_folder_name(chat_id: int, state: FSMContext, pending: dict) -> No
     kb_rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"fld:{i}")]
                for i, n in enumerate(names)]
     kb_rows.append([InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")])
-    await bot.send_message(chat_id, pending["note"] + texts.ask_folder_line(), parse_mode="HTML",
+    await bot.send_message(chat_id, pending["note"] + texts.ask_folder_line(parent_name), parse_mode="HTML",
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 

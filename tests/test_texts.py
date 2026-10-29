@@ -112,3 +112,12 @@ def test_queue_texts():
     for t in (texts.queue_dropped([EVIL], EVIL), texts.queue_no_account(), texts.queue_revoked(),
               texts.queue_crashed(), texts.queue_added(1, None)):
         _valid(t)
+
+
+def test_parent_texts():
+    for t in (texts.parent_missing(EVIL), texts.parent_missing(EVIL, queued=True),
+              texts.parent_menu(EVIL, EVIL, True), texts.parent_menu("a@b.c", None, False),
+              texts.parent_set(EVIL), texts.ask_folder_line(EVIL)):
+        _valid(t)
+    assert "корень Диска" in texts.parent_menu("a@b.c", None, False)
+    assert "снята" in texts.parent_set(None)

@@ -39,7 +39,7 @@ def dp():
 
 def test_dispatcher_has_all_routers(dp):
     assert [r.name for r in dp.sub_routers] == ["start", "settings", "history", "queue", "intake"]
-    assert sum(len(r.message.handlers) + len(r.callback_query.handlers) for r in dp.sub_routers) == 36
+    assert sum(len(r.message.handlers) + len(r.callback_query.handlers) for r in dp.sub_routers) == 38
 
 
 class _NoNetworkBot:
